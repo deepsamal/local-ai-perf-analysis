@@ -618,32 +618,56 @@ int main(int argc, char **argv)
     
     /* Configure GPU BPF .rodata knobs BEFORE loading.
      *
-     * Layout MUST match the order/types in trace_cuda.bpf.c:
-     *   __u32 target_pid;
-     *   __u8  capture_stacks;
-     *   __u32 sample_period_sync;
-     *   __u32 sample_period_async;
-     *
-     * BPF .rodata is laid out by clang in declaration order with natural
-     * alignment; this packed struct mirrors that layout. If you reorder
-     * the const volatile declarations in the .bpf.c file, update here.
+     * This struct MUST match `struct cuda_tracer_cfg` in trace_cuda.bpf.c
+     * exactly. We use a single struct (rather than separate variables)
+     * because clang for BPF reorders independent globals by size to pack
+     * .rodata tightly, which makes any external layout assumption fragile.
+     * A single struct uses ordinary C layout rules — predictable on both
+     * sides.
      */
-    struct gpu_rodata_layout {
+    struct cuda_tracer_cfg {
         __u32 target_pid;
-        __u8  capture_stacks;
-        __u8  _pad[3];
         __u32 sample_period_sync;
         __u32 sample_period_async;
-    } __attribute__((packed));
-    struct gpu_rodata_layout gpu_cfg = {
+        __u8  capture_stacks;
+        __u8  _pad[3];
+    };
+    struct cuda_tracer_cfg gpu_cfg = {
         .target_pid          = (__u32)target_pid,
-        .capture_stacks      = (__u8)capture_stacks_cli,
         .sample_period_sync  = (__u32)sample_period_sync,
         .sample_period_async = (__u32)sample_period_async,
+        .capture_stacks      = (__u8)capture_stacks_cli,
     };
+    /* Find the .rodata map by its actual libbpf-assigned name. Newer
+     * libbpf prefixes the section with the object name (e.g.
+     * "trace_cu.rodata") so a plain ".rodata" lookup fails silently.
+     * Fall back to scanning all maps if the literal name isn't found.
+     */
     struct bpf_map *gpu_rodata = bpf_object__find_map_by_name(gpu_obj, ".rodata");
+    if (!gpu_rodata) {
+        struct bpf_map *m;
+        bpf_object__for_each_map(m, gpu_obj) {
+            const char *name = bpf_map__name(m);
+            if (name && strstr(name, ".rodata")) {
+                gpu_rodata = m;
+                break;
+            }
+        }
+    }
     if (gpu_rodata) {
-        bpf_map__set_initial_value(gpu_rodata, &gpu_cfg, sizeof(gpu_cfg));
+        size_t actual_sz = bpf_map__value_size(gpu_rodata);
+        if (actual_sz != sizeof(gpu_cfg)) {
+            fprintf(stderr,
+                    "WARNING: GPU .rodata size mismatch (kernel=%zu, user=%zu); "
+                    "PID filter and stack sampling may be ignored.\n",
+                    actual_sz, sizeof(gpu_cfg));
+        }
+        int rc = bpf_map__set_initial_value(gpu_rodata, &gpu_cfg, sizeof(gpu_cfg));
+        if (rc) {
+            fprintf(stderr, "WARNING: failed to set GPU .rodata: %d\n", rc);
+        }
+    } else {
+        fprintf(stderr, "WARNING: GPU .rodata map not found; using defaults\n");
     }
 
     err = bpf_object__load(gpu_obj);

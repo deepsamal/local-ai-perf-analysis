@@ -17,7 +17,8 @@ use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::slice;
 
-use blazesym::symbolize::{Process, Source, Sym, Symbolized, Symbolizer};
+use blazesym::symbolize::source::{Process, Source};
+use blazesym::symbolize::{Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 
 /// Maximum length of any symbol/file string we'll write into the output buffer.
@@ -137,7 +138,11 @@ pub unsafe extern "C" fn bsw_resolve(
     let out_slice = slice::from_raw_parts_mut(out, out_cap);
 
     let src = Source::Process(Process::new(Pid::from(pid)));
-    let results = match symbolizer.symbolize(&src, addrs_slice) {
+    // BPF stack frames are absolute addresses in the target process's
+    // virtual address space, so Input::AbsAddr is the right variant.
+    // (Input::VirtOffset is for ELF-relative offsets; FileOffset for
+    // raw file offsets — both wrong here.)
+    let results = match symbolizer.symbolize(&src, Input::AbsAddr(addrs_slice)) {
         Ok(r) => r,
         Err(_) => return 0,
     };

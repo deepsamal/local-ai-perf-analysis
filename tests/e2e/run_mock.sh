@@ -18,8 +18,12 @@ BIN="$REPO_ROOT/bin/unified_trace"
 LIB="$MOCK_DIR/libfake_cudart.so"
 WORKLOAD="$MOCK_DIR/workload"
 OUT="${OUT:-/tmp/mock_trace.json}"
-ITERS="${ITERS:-50}"
-DURATION="${DURATION:-15}"
+# Bumped from 50: each iter is fast (~270 µs of busy-wait), so we need
+# enough of them to produce a meaningful event count even with the
+# inter-iter usleep added in workload.c.
+ITERS="${ITERS:-200}"
+# Bumped to comfortably cover workload warmup (3s) + iter run (~1s).
+DURATION="${DURATION:-20}"
 BENCH=0
 
 for arg in "$@"; do

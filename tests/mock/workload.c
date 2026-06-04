@@ -147,13 +147,26 @@ int main(int argc, char **argv)
             getpid(), iters, EVENTS_PER_ITER, iters * EVENTS_PER_ITER);
     fflush(stdout);
 
-    /* Brief warmup so the tracer has time to attach probes before we
-     * start emitting. The shell wrapper waits 1s after launching us.
+    /* Warmup window. The tracer attaches ~30 uprobes; each requires
+     * opening libcudart.so + locating the symbol + perf_event_open,
+     * which on a slow box can take 1–2 seconds total. We sleep here
+     * so the workload doesn't sprint through its iters before the
+     * probes are armed. The shell wrapper sleeps too, so total
+     * attach window is ~3s.
      */
-    usleep(500 * 1000);
+    fprintf(stderr, "MOCK_WORKLOAD warmup_start\n");
+    sleep(3);
+    fprintf(stderr, "MOCK_WORKLOAD warmup_done starting_iters\n");
 
-    for (int i = 0; i < iters; i++)
+    for (int i = 0; i < iters; i++) {
         run_iter(&s);
+        /* Sprinkle a 1 ms inter-iter sleep so 100 iters take ~100 ms
+         * of wall-clock + ~30 ms of in-CUDA-call busy-wait. That gives
+         * the tracer plenty of polls to consume events even if a
+         * couple of probes attach late.
+         */
+        usleep(1000);
+    }
 
     fprintf(stderr, "MOCK_WORKLOAD done iters=%d total_events=%d\n",
             iters, iters * EVENTS_PER_ITER);

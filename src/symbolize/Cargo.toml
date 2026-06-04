@@ -7,6 +7,8 @@ description = "C ABI wrapper around blazesym for unified_trace's stack symboliza
 
 [lib]
 name = "blazesym_wrap"
+# Source isn't at the Cargo default (src/lib.rs); tell it where to look.
+path = "blazesym_wrap.rs"
 # staticlib lets the C side just link target/release/libblazesym_wrap.a
 crate-type = ["staticlib"]
 

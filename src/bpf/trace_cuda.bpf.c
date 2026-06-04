@@ -52,11 +52,27 @@ struct {
     __type(value, __u64);
 } stack_sample_counter SEC(".maps");
 
-/* User-tunable knobs. Set via libbpf .rodata before bpf_object__load(). */
-const volatile __u32 target_pid = 0;          /* 0 = all PIDs */
-const volatile __u8  capture_stacks = 1;      /* 0 = disable stack capture entirely */
-const volatile __u32 sample_period_sync = 1;  /* sync calls: every event by default */
-const volatile __u32 sample_period_async = 8; /* async calls: 1-in-8 by default */
+/* User-tunable knobs. Set via libbpf .rodata before bpf_object__load().
+ *
+ * We use a single struct here (not individual `const volatile` globals)
+ * specifically because clang for BPF is free to reorder separately-
+ * declared globals by size for tighter .rodata packing. The struct
+ * forces a deterministic layout that user-space can mirror exactly.
+ * The same struct definition lives in unified_trace.c.
+ */
+struct cuda_tracer_cfg {
+    __u32 target_pid;            /* 0 = all PIDs */
+    __u32 sample_period_sync;    /* sync calls: every Nth event captures stack */
+    __u32 sample_period_async;   /* async calls: every Nth event captures stack */
+    __u8  capture_stacks;        /* 0 = disable stack capture entirely */
+    __u8  _pad[3];
+};
+const volatile struct cuda_tracer_cfg cfg = {
+    .target_pid          = 0,
+    .sample_period_sync  = 1,
+    .sample_period_async = 8,
+    .capture_stacks      = 1,
+};
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -67,7 +83,7 @@ const volatile __u32 sample_period_async = 8; /* async calls: 1-in-8 by default 
  */
 static __always_inline __s32 maybe_capture_stack(struct pt_regs *ctx, __u32 flags)
 {
-    if (!capture_stacks)
+    if (!cfg.capture_stacks)
         return -1;
 
     __u32 key = 0;
@@ -75,8 +91,8 @@ static __always_inline __s32 maybe_capture_stack(struct pt_regs *ctx, __u32 flag
     if (!cnt)
         return -1;
 
-    __u32 period = (flags & CUDA_EV_FLAG_ASYNC) ? sample_period_async
-                                                : sample_period_sync;
+    __u32 period = (flags & CUDA_EV_FLAG_ASYNC) ? cfg.sample_period_async
+                                                : cfg.sample_period_sync;
     if (period == 0)
         period = 1;
 
@@ -99,7 +115,7 @@ static __always_inline int record_entry(struct pt_regs *ctx,
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
 
-    if (target_pid != 0 && pid != target_pid)
+    if (cfg.target_pid != 0 && pid != cfg.target_pid)
         return 1;
 
     struct cuda_call_info info = {};

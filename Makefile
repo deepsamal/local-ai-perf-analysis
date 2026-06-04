@@ -46,7 +46,12 @@ BLAZESYM_LDFLAGS := -lpthread -ldl -lm
 
 # Detect cargo at config time; if absent we still build everything else
 # and unified_trace falls back to the raw-address resolver.
-HAVE_CARGO := $(shell command -v $(CARGO) 2>/dev/null)
+#
+# IMPORTANT: also treat the case where the .a is already built but cargo
+# isn't currently on PATH (happens under `sudo make` because sudo strips
+# $HOME/.cargo/bin from PATH). Without this, sudo silently re-links
+# unified_trace against the NULL-returning stub.
+HAVE_CARGO := $(or $(wildcard $(BLAZESYM_LIB)),$(shell command -v $(CARGO) 2>/dev/null))
 
 # Find all BPF and user programs
 BPF_SRC := $(wildcard $(BPF_DIR)/*.bpf.c)
