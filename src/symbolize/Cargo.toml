@@ -1,0 +1,22 @@
+[package]
+name = "blazesym_wrap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C ABI wrapper around blazesym for unified_trace's stack symbolization."
+
+[lib]
+name = "blazesym_wrap"
+# staticlib lets the C side just link target/release/libblazesym_wrap.a
+crate-type = ["staticlib"]
+
+[dependencies]
+# Pin a minor version that exposes Symbolizer + Process source + perf-map handling.
+# 0.2.x line is current as of mid-2026 and supports debuginfod + auto perf-map.
+blazesym = "0.2"
+
+[profile.release]
+# LTO trims the static archive size noticeably and improves resolution latency.
+lto = true
+codegen-units = 1
+strip = true

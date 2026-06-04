@@ -1,0 +1,96 @@
+# GitHub Actions workflow for local-ai-perf-analysis.
+#
+# To activate: copy/symlink this file to .github/workflows/ci.yml at
+# the repo root. It's kept under tests/ci/ for visibility — the file
+# is a meaningful part of the test harness, not a hidden tool.
+#
+# Jobs:
+#   build       — clang + libbpf + cargo; always runs.
+#   unit-mock   — `make test` (unit + mock-CUDA e2e). Needs sudo for
+#                 eBPF; works on the standard Ubuntu runner.
+#   gpu         — `make test-gpu` + `make test-python`. Only runs on a
+#                 self-hosted runner labeled `gpu`; the public matrix
+#                 skips this job cleanly.
+#
+# Why split: the unit+mock tier MUST pass on every PR (no GPU, no
+# Python deps, fast). The gpu tier is a soft gate that exercises the
+# real attribution pipeline but is gated on hardware that not every
+# contributor will have.
+
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev libelf-dev zlib1g-dev \
+            linux-headers-$(uname -r) build-essential
+
+      - name: install rust (for blazesym wrapper)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build everything
+        run: make
+
+      - name: build mock
+        run: make mock
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin
+          path: |
+            bin/
+            obj/
+            tests/mock/libfake_cudart.so
+            tests/mock/workload
+
+  unit-mock:
+    name: unit+mock (no GPU)
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build + run deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev libelf-dev zlib1g-dev \
+            linux-headers-$(uname -r) build-essential python3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: make
+      - name: mock
+        run: make mock
+      - name: run unit tests
+        run: make -C tests/unit test
+      - name: run mock e2e
+        run: sudo -E bash tests/e2e/run_mock.sh
+
+  gpu:
+    name: gpu + python (self-hosted)
+    needs: build
+    runs-on: [self-hosted, gpu]
+    if: ${{ github.repository_owner == 'YOUR_GITHUB_USER' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: make
+      - name: gpu e2e
+        run: sudo -E bash tests/e2e/run_gpu.sh
+      - name: python agent e2e
+        run: sudo -E bash tests/e2e/run_python_agent.sh

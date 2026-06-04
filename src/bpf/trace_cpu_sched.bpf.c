@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
+/* clang -target bpf defines __BPF__ automatically; common.h and maps.h
+ * both gate BPF-only blocks on that macro.
+ */
 #include "common.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include "maps.h"  /* shared, pinned stack_traces map */
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -12,13 +16,10 @@ struct {
     __uint(max_entries, 512 * 1024); /* 512 KB */
 } cpu_events SEC(".maps");
 
-/* Stack trace map */
-struct {
-    __uint(type, BPF_MAP_TYPE_STACK_TRACE);
-    __uint(max_entries, 10000);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, PERF_MAX_STACK_DEPTH * sizeof(__u64));
-} stack_traces SEC(".maps");
+/* stack_traces map is declared in maps.h and shared (pinned by name)
+ * with trace_cuda.bpf.c so both BPF objects produce stack IDs in the
+ * same address space.
+ */
 
 /* Filter: only trace specific PID (0 = trace all) */
 const volatile __u32 target_pid = 0;

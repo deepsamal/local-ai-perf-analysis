@@ -24,6 +24,15 @@ static const char* cuda_op_name(int op_type)
         case CUDA_OP_MEMCPY: return "cudaMemcpy";
         case CUDA_OP_LAUNCH_KERNEL: return "cudaLaunchKernel";
         case CUDA_OP_SYNC: return "cudaDeviceSynchronize";
+        case CUDA_OP_MEMCPY_ASYNC: return "cudaMemcpyAsync";
+        case CUDA_OP_STREAM_SYNC: return "cudaStreamSynchronize";
+        case CUDA_OP_STREAM_CREATE: return "cudaStreamCreate";
+        case CUDA_OP_STREAM_DESTROY: return "cudaStreamDestroy";
+        case CUDA_OP_EVENT_RECORD: return "cudaEventRecord";
+        case CUDA_OP_EVENT_SYNC: return "cudaEventSynchronize";
+        case CUDA_OP_EVENT_QUERY: return "cudaEventQuery";
+        case CUDA_OP_LAUNCH_KERNEL_EX: return "cudaLaunchKernelExC";
+        case CUDA_OP_GRAPH_LAUNCH: return "cudaGraphLaunch";
         default: return "Unknown";
     }
 }
@@ -61,21 +70,54 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
             print_size_human(e->size);
             break;
         case CUDA_OP_FREE:
-            printf("ptr=0x%llx", e->ptr);
+            printf("ptr=0x%llx", (unsigned long long)e->ptr);
             break;
         case CUDA_OP_MEMCPY:
             printf("size=");
             print_size_human(e->size);
             break;
+        case CUDA_OP_MEMCPY_ASYNC:
+            printf("size=");
+            print_size_human(e->size);
+            printf(" stream=0x%llx", (unsigned long long)e->stream_id);
+            break;
         case CUDA_OP_LAUNCH_KERNEL:
-            printf("kernel_launch");
+            printf("kernel_launch func=0x%llx", (unsigned long long)e->ptr);
+            break;
+        case CUDA_OP_LAUNCH_KERNEL_EX:
+            printf("kernel_launch_ex");
+            break;
+        case CUDA_OP_GRAPH_LAUNCH:
+            printf("graph_launch stream=0x%llx", (unsigned long long)e->stream_id);
             break;
         case CUDA_OP_SYNC:
             printf("device_sync");
             break;
+        case CUDA_OP_STREAM_SYNC:
+            printf("stream_sync stream=0x%llx", (unsigned long long)e->stream_id);
+            break;
+        case CUDA_OP_STREAM_CREATE:
+            printf("stream_create");
+            break;
+        case CUDA_OP_STREAM_DESTROY:
+            printf("stream_destroy stream=0x%llx", (unsigned long long)e->stream_id);
+            break;
+        case CUDA_OP_EVENT_RECORD:
+            printf("event_record event=0x%llx stream=0x%llx",
+                   (unsigned long long)e->ptr, (unsigned long long)e->stream_id);
+            break;
+        case CUDA_OP_EVENT_SYNC:
+            printf("event_sync event=0x%llx", (unsigned long long)e->ptr);
+            break;
+        case CUDA_OP_EVENT_QUERY:
+            printf("event_query event=0x%llx", (unsigned long long)e->ptr);
+            break;
     }
-    
-    printf(" duration=%.3f ms ret=%d\n", duration_ms, e->ret_val);
+
+    printf(" duration=%.3f ms ret=%d", duration_ms, e->ret_val);
+    if (e->stack_id >= 0)
+        printf(" stack_id=%d", e->stack_id);
+    printf("\n");
     
     return 0;
 }
@@ -101,7 +143,8 @@ static char* find_cuda_library(void)
 int main(int argc, char **argv)
 {
     struct bpf_object *obj = NULL;
-    struct bpf_link *links[12] = {NULL};
+    /* Sized for the full set of entry+return probes (14 ops × 2). */
+    struct bpf_link *links[32] = {NULL};
     struct ring_buffer *rb = NULL;
     int err, map_fd, link_idx = 0;
     const char *obj_path = "obj/trace_cuda.bpf.o";
@@ -145,11 +188,17 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    /* Attach uprobes for CUDA functions */
+    /* Attach uprobes for CUDA functions.
+     * Order matters only for log readability — attach failures for any
+     * single function are non-fatal so users on older CUDA versions
+     * that lack newer symbols (e.g. cudaLaunchKernelExC) still get
+     * a working tracer for the symbols that do exist.
+     */
     struct {
         const char *func_name;
         const char *probe_name;
     } cuda_funcs[] = {
+        /* Synchronous ops (original) */
         {"cudaMalloc", "trace_cuda_malloc_entry"},
         {"cudaMalloc", "trace_cuda_malloc_return"},
         {"cudaFree", "trace_cuda_free_entry"},
@@ -160,6 +209,25 @@ int main(int argc, char **argv)
         {"cudaLaunchKernel", "trace_cuda_launch_return"},
         {"cudaDeviceSynchronize", "trace_cuda_sync_entry"},
         {"cudaDeviceSynchronize", "trace_cuda_sync_return"},
+        /* Async / stream-aware ops (added for AI-agent perf analysis) */
+        {"cudaMemcpyAsync", "trace_cuda_memcpy_async_entry"},
+        {"cudaMemcpyAsync", "trace_cuda_memcpy_async_return"},
+        {"cudaStreamSynchronize", "trace_cuda_stream_sync_entry"},
+        {"cudaStreamSynchronize", "trace_cuda_stream_sync_return"},
+        {"cudaStreamCreate", "trace_cuda_stream_create_entry"},
+        {"cudaStreamCreate", "trace_cuda_stream_create_return"},
+        {"cudaStreamDestroy", "trace_cuda_stream_destroy_entry"},
+        {"cudaStreamDestroy", "trace_cuda_stream_destroy_return"},
+        {"cudaEventRecord", "trace_cuda_event_record_entry"},
+        {"cudaEventRecord", "trace_cuda_event_record_return"},
+        {"cudaEventSynchronize", "trace_cuda_event_sync_entry"},
+        {"cudaEventSynchronize", "trace_cuda_event_sync_return"},
+        {"cudaEventQuery", "trace_cuda_event_query_entry"},
+        {"cudaEventQuery", "trace_cuda_event_query_return"},
+        {"cudaLaunchKernelExC", "trace_cuda_launch_ex_entry"},
+        {"cudaLaunchKernelExC", "trace_cuda_launch_ex_return"},
+        {"cudaGraphLaunch", "trace_cuda_graph_launch_entry"},
+        {"cudaGraphLaunch", "trace_cuda_graph_launch_return"},
     };
     
     for (int i = 0; i < sizeof(cuda_funcs) / sizeof(cuda_funcs[0]); i++) {
@@ -233,11 +301,11 @@ int main(int argc, char **argv)
 
 cleanup:
     ring_buffer__free(rb);
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < (int)(sizeof(links)/sizeof(links[0])); i++) {
         bpf_link__destroy(links[i]);
     }
     bpf_object__close(obj);
     free(cuda_lib_path);
-    
+
     return err != 0;
 }

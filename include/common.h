@@ -115,8 +115,22 @@ enum cuda_op_type {
     CUDA_OP_FREE = 2,
     CUDA_OP_MEMCPY = 3,
     CUDA_OP_LAUNCH_KERNEL = 4,
-    CUDA_OP_SYNC = 5,
+    CUDA_OP_SYNC = 5,                 /* cudaDeviceSynchronize */
+    /* Async / stream-aware ops added for AI-agent workloads */
+    CUDA_OP_MEMCPY_ASYNC = 6,
+    CUDA_OP_STREAM_SYNC = 7,          /* cudaStreamSynchronize */
+    CUDA_OP_STREAM_CREATE = 8,
+    CUDA_OP_STREAM_DESTROY = 9,
+    CUDA_OP_EVENT_RECORD = 10,
+    CUDA_OP_EVENT_SYNC = 11,          /* cudaEventSynchronize */
+    CUDA_OP_EVENT_QUERY = 12,
+    CUDA_OP_LAUNCH_KERNEL_EX = 13,    /* cudaLaunchKernelExC */
+    CUDA_OP_GRAPH_LAUNCH = 14,        /* cudaGraphLaunch */
 };
+
+/* cuda_event flags (bitfield) */
+#define CUDA_EV_FLAG_ASYNC        (1U << 0)  /* operation is async w.r.t. host */
+#define CUDA_EV_FLAG_STACK_SAMPLED (1U << 1)  /* stack trace captured for this event */
 
 /* CPU scheduling event types */
 enum cpu_sched_type {
@@ -154,6 +168,10 @@ struct cuda_event {
     __u64 ptr;
     int ret_val;
     char comm[TASK_COMM_LEN];
+    /* Async/stream-aware fields (added for AI agent perf analysis) */
+    __u64 stream_id;     /* cudaStream_t opaque value; 0 = default/legacy stream */
+    __s32 stack_id;      /* BPF stack ID of submitting user-space frame, -1 if not captured */
+    __u32 flags;         /* CUDA_EV_FLAG_* bitfield */
 };
 
 /* Internal structure for tracking CUDA calls */
@@ -163,6 +181,9 @@ struct cuda_call_info {
     __u32 pid;
     __u64 size;
     __u64 ptr;
+    __u64 stream_id;     /* captured at entry, forwarded to event on return */
+    __s32 stack_id;      /* captured at entry on submitting thread */
+    __u32 flags;
 };
 
 /* Data structure for CPU scheduling events */

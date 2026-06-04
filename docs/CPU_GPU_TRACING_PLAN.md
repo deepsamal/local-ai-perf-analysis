@@ -1,5 +1,14 @@
 # CPU+GPU Unified Tracing Plan
 
+> **Status (2026-06):** Phases 1, 2, and 4 are implemented. Phase 3 (syscall tracing) deferred — covered by AgentSight for the agent ↔ LLM-server case. See [RELATED_WORK.md](RELATED_WORK.md) for the positioning that drove this scoping decision.
+>
+> - ✅ **Phase 1 — Enhanced GPU tracing.** Async CUDA hooks (memcpyAsync, stream/event sync, graph launch, stream lifecycle) added in [src/bpf/trace_cuda.bpf.c](../src/bpf/trace_cuda.bpf.c). Stack capture on entry probes, per-op sampling, blazesym symbolization.
+> - ✅ **Phase 2 — CPU on/off-CPU tracing.** Already present; now shares the stack-trace map with the CUDA tracer for cross-source attribution.
+> - ⏸ **Phase 3 — Syscall tracing.** Deferred. AgentSight already covers the agent ↔ LLM-server boundary that motivated this phase.
+> - ✅ **Phase 4 — Unified timeline.** Per-CUDA-stream rows in Chrome JSON; stack arrays attached to events; stream/async flags exposed for downstream filtering.
+>
+> The original plan text below is preserved for reference.
+
 ## Objective
 Create a comprehensive tracing system to identify CPU stalls and inefficiencies that manifest in user experience, with correlation to GPU workload.
 

@@ -10,12 +10,21 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "common.h"
+#include "blazesym_wrap.h"
 
 static volatile bool exiting = false;
 
 /* Stack trace map FD */
 static int stack_map_fd = -1;
 static int target_pid_for_stacks = 0;
+
+/* blazesym symbolizer handle. NULL = symbolization disabled (build w/o
+ * Rust toolchain or --no-symbolize flag). When NULL we fall back to the
+ * old lib+offset format so the tracer still works.
+ */
+static bsw_symbolizer_t *symbolizer = NULL;
+static int symbolize_enabled = 1;
+static int max_stack_frames_in_json = 12; /* truncate JSON stacks to keep file size bounded */
 
 /* Collected events */
 #define MAX_EVENTS 100000
@@ -42,7 +51,39 @@ static const char* cuda_op_name(int op_type)
         case CUDA_OP_MEMCPY: return "cudaMemcpy";
         case CUDA_OP_LAUNCH_KERNEL: return "cudaLaunchKernel";
         case CUDA_OP_SYNC: return "cudaDeviceSynchronize";
+        case CUDA_OP_MEMCPY_ASYNC: return "cudaMemcpyAsync";
+        case CUDA_OP_STREAM_SYNC: return "cudaStreamSynchronize";
+        case CUDA_OP_STREAM_CREATE: return "cudaStreamCreate";
+        case CUDA_OP_STREAM_DESTROY: return "cudaStreamDestroy";
+        case CUDA_OP_EVENT_RECORD: return "cudaEventRecord";
+        case CUDA_OP_EVENT_SYNC: return "cudaEventSynchronize";
+        case CUDA_OP_EVENT_QUERY: return "cudaEventQuery";
+        case CUDA_OP_LAUNCH_KERNEL_EX: return "cudaLaunchKernelExC";
+        case CUDA_OP_GRAPH_LAUNCH: return "cudaGraphLaunch";
         default: return "Unknown";
+    }
+}
+
+/* Categorize ops for Chrome Tracing "cat" field. */
+static const char* cuda_op_category(int op_type)
+{
+    switch (op_type) {
+        case CUDA_OP_SYNC:
+        case CUDA_OP_STREAM_SYNC:
+        case CUDA_OP_EVENT_SYNC:
+            return "gpu_sync";          /* CPU blocks here — interesting for stall analysis */
+        case CUDA_OP_MEMCPY:
+        case CUDA_OP_MEMCPY_ASYNC:
+            return "gpu_xfer";          /* data movement */
+        case CUDA_OP_LAUNCH_KERNEL:
+        case CUDA_OP_LAUNCH_KERNEL_EX:
+        case CUDA_OP_GRAPH_LAUNCH:
+            return "gpu_compute";
+        case CUDA_OP_MALLOC:
+        case CUDA_OP_FREE:
+            return "gpu_mem";
+        default:
+            return "gpu";
     }
 }
 
@@ -84,73 +125,116 @@ static int handle_gpu_event(void *ctx, void *data, size_t data_sz)
     return 0;
 }
 
-/* Simple symbol resolution: find library name for an address */
-static int resolve_address_to_lib(int pid, __u64 addr, char *lib_name, size_t lib_name_len, __u64 *offset)
+/* Escape a string for embedding in JSON. Conservatively handles the
+ * characters that actually appear in symbol names (quote, backslash,
+ * control characters). Truncates to dst_len-1 bytes.
+ */
+static void json_escape(char *dst, size_t dst_len, const char *src)
 {
-    char maps_file[64];
-    snprintf(maps_file, sizeof(maps_file), "/proc/%d/maps", pid);
-    
-    FILE *f = fopen(maps_file, "r");
-    if (!f) return -1;
-    
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        __u64 start, end, file_offset;
-        char perms[8], dev[16], inode[32];
-        char path[256] = "";
-        
-        int n = sscanf(line, "%llx-%llx %s %llx %s %s %[^\n]",
-                      &start, &end, perms, &file_offset, dev, inode, path);
-        
-        if (addr >= start && addr < end) {
-            *offset = addr - start + file_offset;
-            if (n >= 7 && path[0] != '\0') {
-                /* Extract just the basename */
-                char *basename = strrchr(path, '/');
-                snprintf(lib_name, lib_name_len, "%s", basename ? basename + 1 : path);
-            } else if (perms[0] == 'r' && perms[2] == 'x') {
-                snprintf(lib_name, lib_name_len, "[exec]");
-            } else {
-                snprintf(lib_name, lib_name_len, "[anon]");
-            }
-            fclose(f);
-            return 0;
+    size_t di = 0;
+    if (dst_len == 0) return;
+    for (size_t si = 0; src[si] && di + 2 < dst_len; si++) {
+        unsigned char c = (unsigned char)src[si];
+        if (c == '"' || c == '\\') {
+            if (di + 3 >= dst_len) break;
+            dst[di++] = '\\';
+            dst[di++] = c;
+        } else if (c < 0x20) {
+            if (di + 7 >= dst_len) break;
+            di += snprintf(dst + di, dst_len - di, "\\u%04x", c);
+        } else {
+            dst[di++] = c;
         }
     }
-    
-    fclose(f);
-    return -1;
+    dst[di] = '\0';
 }
 
-/* Get stack trace and resolve to function/library names */
-static void get_stack_info(int stack_id, int pid, char *output, size_t output_len)
+/* Pull stack addresses from the BPF stack map for the given stack_id.
+ * Returns the number of valid (non-zero) addresses written into out[].
+ */
+static int read_stack_addrs(int stack_id, __u64 *out, int out_cap)
 {
-    if (stack_id < 0 || stack_map_fd < 0) {
-        output[0] = '\0';
-        return;
-    }
-    
+    if (stack_id < 0 || stack_map_fd < 0)
+        return 0;
+
     __u64 stack[PERF_MAX_STACK_DEPTH];
-    if (bpf_map_lookup_elem(stack_map_fd, &stack_id, stack) != 0) {
-        output[0] = '\0';
+    memset(stack, 0, sizeof(stack));
+    if (bpf_map_lookup_elem(stack_map_fd, &stack_id, stack) != 0)
+        return 0;
+
+    int n = 0;
+    for (int i = 0; i < PERF_MAX_STACK_DEPTH && n < out_cap; i++) {
+        if (stack[i] == 0)
+            break;
+        out[n++] = stack[i];
+    }
+    return n;
+}
+
+/* Write a JSON array of resolved stack frames to `f` for the given
+ * stack_id, attributed to `pid`. Emits exactly one JSON value (an
+ * array). If symbolization is disabled or fails, falls back to a list
+ * of raw hex addresses so the caller still has something to grep on.
+ *
+ * Format:
+ *   [{"sym":"...", "file":"...", "line":123, "lib":"libfoo.so", "inlined":0}, ...]
+ */
+static void emit_stack_json(FILE *f, int stack_id, int pid)
+{
+    __u64 addrs[PERF_MAX_STACK_DEPTH];
+    int n = read_stack_addrs(stack_id, addrs, PERF_MAX_STACK_DEPTH);
+    if (n == 0) {
+        fprintf(f, "[]");
         return;
     }
-    
-    /* Find first valid address and resolve it */
-    char lib[128] = "unknown";
-    __u64 offset = 0;
-    for (int i = 0; i < PERF_MAX_STACK_DEPTH && stack[i] != 0; i++) {
-        if (stack[i] != 0) {
-            if (resolve_address_to_lib(pid, stack[i], lib, sizeof(lib), &offset) == 0) {
-                snprintf(output, output_len, "%s+0x%llx", lib, offset);
-            } else {
-                snprintf(output, output_len, "0x%llx", stack[i]);
-            }
-            return;
+    if (n > max_stack_frames_in_json)
+        n = max_stack_frames_in_json;
+
+    if (!symbolize_enabled || symbolizer == NULL) {
+        /* Fallback: raw addresses. Still useful for grep/manual addr2line. */
+        fprintf(f, "[");
+        for (int i = 0; i < n; i++) {
+            fprintf(f, "%s{\"addr\":\"0x%llx\"}", i ? "," : "",
+                    (unsigned long long)addrs[i]);
         }
+        fprintf(f, "]");
+        return;
     }
-    
-    output[0] = '\0';
+
+    /* blazesym can expand inlined frames, so allocate headroom. */
+    int frame_cap = n * 4;
+    struct bsw_frame *frames = calloc(frame_cap, sizeof(*frames));
+    if (!frames) {
+        fprintf(f, "[]");
+        return;
+    }
+
+    size_t nout = bsw_resolve(symbolizer, (uint32_t)pid,
+                              addrs, (size_t)n,
+                              frames, (size_t)frame_cap);
+
+    fprintf(f, "[");
+    char esc_sym[BSW_STR_MAX * 2];
+    char esc_file[BSW_STR_MAX * 2];
+    char esc_lib[BSW_STR_MAX * 2];
+    for (size_t i = 0; i < nout; i++) {
+        json_escape(esc_sym, sizeof(esc_sym),
+                    frames[i].sym[0] ? frames[i].sym : "??");
+        json_escape(esc_file, sizeof(esc_file), frames[i].file);
+        json_escape(esc_lib, sizeof(esc_lib), frames[i].lib);
+        fprintf(f, "%s{\"sym\":\"%s\"", i ? "," : "", esc_sym);
+        if (esc_file[0])
+            fprintf(f, ",\"file\":\"%s\"", esc_file);
+        if (frames[i].line)
+            fprintf(f, ",\"line\":%u", frames[i].line);
+        if (esc_lib[0])
+            fprintf(f, ",\"lib\":\"%s\"", esc_lib);
+        if (frames[i].inlined)
+            fprintf(f, ",\"inlined\":1");
+        fprintf(f, "}");
+    }
+    fprintf(f, "]");
+    free(frames);
 }
 
 static int compare_events(const void *a, const void *b)
@@ -244,26 +328,24 @@ static void output_chrome_tracing_json(const char *filename)
                 if (cpu->tid < 10000000) {
                     cpu_on_time[cpu->tid] = e->timestamp;
                 }
-                
+
                 if (output_count > 0) fprintf(f, ",\n");
-                
-                /* Get stack trace info if available */
-                char stack_info[512] = "";
-                if (cpu->stack_id >= 0 && target_pid_for_stacks > 0) {
-                    get_stack_info(cpu->stack_id, target_pid_for_stacks, stack_info, sizeof(stack_info));
-                }
-                
+
                 /* Keep name consistent as "On-CPU" so Begin/End events match */
                 fprintf(f, "    {\"name\": \"On-CPU\", \"cat\": \"cpu\", "
                         "\"ph\": \"B\", \"ts\": %.3f, \"pid\": %u, \"tid\": %u, "
                         "\"args\": {\"cpu\": %u, \"comm\": \"%s\"",
                         ts_us, cpu->pid, cpu->tid, cpu->cpu, cpu->comm);
-                
-                /* Add stack trace to args if available */
-                if (stack_info[0]) {
-                    fprintf(f, ", \"function\": \"%s\"", stack_info);
+
+                /* Emit resolved stack as a structured array. The pid for
+                 * symbolization is the event's own pid so we can attribute
+                 * stacks from any process, not just the target.
+                 */
+                if (cpu->stack_id >= 0) {
+                    fprintf(f, ", \"stack\": ");
+                    emit_stack_json(f, cpu->stack_id, cpu->pid);
                 }
-                
+
                 fprintf(f, "}}");
                 output_count++;
             } else if (cpu->event_type == CPU_SCHED_OFF) {
@@ -292,37 +374,77 @@ static void output_chrome_tracing_json(const char *filename)
                 should_output = 0;
             }
         } else {
-            /* GPU CUDA event - all on same thread, overlaps will stack vertically */
+            /* GPU CUDA event.
+             * Stream-aware layout: each unique stream gets its own row
+             * inside the GPU "process" so async overlap is visible at a
+             * glance in chrome://tracing. The base GPU virtual tid is
+             * gpu->tid + 1_000_000; we add a stream-hash offset (0–255)
+             * to spread streams across rows. Stream 0 (default) sits on
+             * the base row.
+             */
             struct cuda_event *gpu = &e->gpu;
             double dur_us = gpu->duration_ns / 1000.0;
-            
-            /* Put all GPU operations on a single virtual thread */
-            __u32 gpu_virtual_tid = gpu->tid + 1000000;
-            
+            __u32 stream_offset = 0;
+            if (gpu->stream_id != 0) {
+                /* Mix the high and low halves of the pointer-valued
+                 * stream id, then truncate to 8 bits.
+                 */
+                __u64 s = gpu->stream_id;
+                stream_offset = (__u32)((s ^ (s >> 32)) & 0xFFu);
+                if (stream_offset == 0) stream_offset = 1; /* keep default-stream row clean */
+            }
+            __u32 gpu_virtual_tid = gpu->tid + 1000000 + stream_offset;
+
             if (output_count > 0) fprintf(f, ",\n");
-            fprintf(f, "    {\"name\": \"%s\", \"cat\": \"gpu\", "
+            fprintf(f, "    {\"name\": \"%s\", \"cat\": \"%s\", "
                     "\"ph\": \"X\", \"ts\": %.3f, \"dur\": %.3f, "
                     "\"pid\": %u, \"tid\": %u, "
                     "\"args\": {\"ret\": %d, \"comm\": \"%s\"",
-                    cuda_op_name(gpu->op_type), ts_us, dur_us,
+                    cuda_op_name(gpu->op_type), cuda_op_category(gpu->op_type),
+                    ts_us, dur_us,
                     gpu->pid, gpu_virtual_tid, gpu->ret_val, gpu->comm);
-            
-            /* Add operation-specific args */
-            if (gpu->op_type == CUDA_OP_MALLOC || gpu->op_type == CUDA_OP_MEMCPY) {
-                fprintf(f, ", \"size_bytes\": %llu", gpu->size);
-                if (gpu->size >= 1024*1024*1024) {
+
+            /* Always emit stream_id when non-zero so Perfetto's filter UI
+             * can group by stream.
+             */
+            if (gpu->stream_id != 0)
+                fprintf(f, ", \"stream_id\": \"0x%llx\"",
+                        (unsigned long long)gpu->stream_id);
+
+            /* Mark async ops explicitly so a viewer / downstream tool
+             * can compute overlap metrics without re-deriving from name.
+             */
+            if (gpu->flags & CUDA_EV_FLAG_ASYNC)
+                fprintf(f, ", \"async\": true");
+
+            /* Size-bearing ops */
+            if (gpu->op_type == CUDA_OP_MALLOC ||
+                gpu->op_type == CUDA_OP_MEMCPY ||
+                gpu->op_type == CUDA_OP_MEMCPY_ASYNC) {
+                fprintf(f, ", \"size_bytes\": %llu", (unsigned long long)gpu->size);
+                if (gpu->size >= 1024ULL*1024ULL*1024ULL) {
                     fprintf(f, ", \"size\": \"%.2f GB\"", gpu->size / (1024.0*1024.0*1024.0));
                 } else if (gpu->size >= 1024*1024) {
                     fprintf(f, ", \"size\": \"%.2f MB\"", gpu->size / (1024.0*1024.0));
                 } else if (gpu->size >= 1024) {
                     fprintf(f, ", \"size\": \"%.2f KB\"", gpu->size / 1024.0);
                 } else {
-                    fprintf(f, ", \"size\": \"%llu B\"", gpu->size);
+                    fprintf(f, ", \"size\": \"%llu B\"", (unsigned long long)gpu->size);
                 }
             }
             if (gpu->op_type == CUDA_OP_FREE && gpu->ptr != 0) {
-                fprintf(f, ", \"ptr\": \"0x%llx\"", gpu->ptr);
+                fprintf(f, ", \"ptr\": \"0x%llx\"", (unsigned long long)gpu->ptr);
             }
+
+            /* The novel bit: attribute this async submission to the agent
+             * code that initiated it. Only present when we sampled a stack
+             * AND the user enabled symbolization.
+             */
+            if (gpu->stack_id >= 0) {
+                fprintf(f, ", \"stack\": ");
+                emit_stack_json(f, gpu->stack_id, gpu->pid);
+            }
+
             fprintf(f, "}}");
             output_count++;
         }
@@ -339,23 +461,29 @@ static void output_chrome_tracing_json(const char *filename)
     free(cpu_on_time);
     fclose(f);
     printf("\n✓ Chrome Tracing JSON written to: %s\n", filename);
-    printf("  Open in browser: chrome://tracing\n");
-    printf("  Or upload to: https://ui.perfetto.dev\n");
-    printf("  Note: GPU operations on single thread, overlaps shown stacked\n");
+    printf("  Open in browser: chrome://tracing  (or https://ui.perfetto.dev)\n");
+    printf("  Tip: GPU events are spread across per-stream rows so async\n"
+           "       overlap is visible at a glance. Look for non-overlapping\n"
+           "       gpu_compute rows below a long gpu_sync row to spot stalls.\n");
 }
 
 int main(int argc, char **argv)
 {
     struct bpf_object *cpu_obj = NULL, *gpu_obj = NULL;
     struct bpf_link *sched_switch_link = NULL, *sched_wakeup_link = NULL;
-    struct bpf_link *gpu_links[12] = {NULL};
+    /* Sized for the full CUDA uprobe set (14 ops × 2 entry+return). */
+    struct bpf_link *gpu_links[32] = {NULL};
     struct ring_buffer *cpu_rb = NULL, *gpu_rb = NULL;
     int err, cpu_map_fd, gpu_map_fd;
     int target_pid = 0;
     int duration = 10;
     const char *output_file = "trace.json";
     char *cuda_lib_path = NULL;
-    
+    int capture_stacks_cli = 1;          /* default ON; --no-stacks to disable */
+    int symbolize_cli = 1;               /* default ON; --no-symbolize to disable */
+    int sample_period_async = 8;         /* 1-in-8 by default for async ops */
+    int sample_period_sync = 1;          /* every sync op by default */
+
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
@@ -366,11 +494,30 @@ int main(int argc, char **argv)
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--cuda-lib") == 0 && i + 1 < argc) {
             cuda_lib_path = argv[++i];
+        } else if (strcmp(argv[i], "--no-stacks") == 0) {
+            capture_stacks_cli = 0;
+        } else if (strcmp(argv[i], "--no-symbolize") == 0) {
+            symbolize_cli = 0;
+        } else if (strcmp(argv[i], "--stack-sample-async") == 0 && i + 1 < argc) {
+            sample_period_async = atoi(argv[++i]);
+            if (sample_period_async <= 0) sample_period_async = 1;
+        } else if (strcmp(argv[i], "--stack-sample-sync") == 0 && i + 1 < argc) {
+            sample_period_sync = atoi(argv[++i]);
+            if (sample_period_sync <= 0) sample_period_sync = 1;
+        } else if (strcmp(argv[i], "--max-stack-frames") == 0 && i + 1 < argc) {
+            max_stack_frames_in_json = atoi(argv[++i]);
+            if (max_stack_frames_in_json <= 0) max_stack_frames_in_json = 12;
         } else {
-            fprintf(stderr, "Usage: %s [--pid PID] [--duration SEC] [--output FILE] [--cuda-lib PATH]\n", argv[0]);
+            fprintf(stderr,
+                    "Usage: %s [--pid PID] [--duration SEC] [--output FILE]\n"
+                    "          [--cuda-lib PATH] [--no-stacks] [--no-symbolize]\n"
+                    "          [--stack-sample-async N] [--stack-sample-sync N]\n"
+                    "          [--max-stack-frames N]\n",
+                    argv[0]);
             return 1;
         }
     }
+    symbolize_enabled = symbolize_cli;
     
     if (!cuda_lib_path) {
         /* Try common paths */
@@ -469,21 +616,46 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     
-    /* Set target_pid filter for GPU tracing BEFORE loading */
-    if (target_pid != 0) {
-        struct bpf_map *rodata = bpf_object__find_map_by_name(gpu_obj, ".rodata");
-        if (rodata) {
-            bpf_map__set_initial_value(rodata, &target_pid, sizeof(target_pid));
-        }
+    /* Configure GPU BPF .rodata knobs BEFORE loading.
+     *
+     * Layout MUST match the order/types in trace_cuda.bpf.c:
+     *   __u32 target_pid;
+     *   __u8  capture_stacks;
+     *   __u32 sample_period_sync;
+     *   __u32 sample_period_async;
+     *
+     * BPF .rodata is laid out by clang in declaration order with natural
+     * alignment; this packed struct mirrors that layout. If you reorder
+     * the const volatile declarations in the .bpf.c file, update here.
+     */
+    struct gpu_rodata_layout {
+        __u32 target_pid;
+        __u8  capture_stacks;
+        __u8  _pad[3];
+        __u32 sample_period_sync;
+        __u32 sample_period_async;
+    } __attribute__((packed));
+    struct gpu_rodata_layout gpu_cfg = {
+        .target_pid          = (__u32)target_pid,
+        .capture_stacks      = (__u8)capture_stacks_cli,
+        .sample_period_sync  = (__u32)sample_period_sync,
+        .sample_period_async = (__u32)sample_period_async,
+    };
+    struct bpf_map *gpu_rodata = bpf_object__find_map_by_name(gpu_obj, ".rodata");
+    if (gpu_rodata) {
+        bpf_map__set_initial_value(gpu_rodata, &gpu_cfg, sizeof(gpu_cfg));
     }
-    
+
     err = bpf_object__load(gpu_obj);
     if (err) {
         fprintf(stderr, "ERROR: failed to load GPU BPF object: %d\n", err);
         goto cleanup;
     }
     
-    /* Attach CUDA uprobes */
+    /* Attach CUDA uprobes. Failure for any single function is non-fatal
+     * — newer ops (cudaLaunchKernelExC, cudaGraphLaunch) may be absent
+     * in older libcudart and we still want a useful tracer.
+     */
     struct {
         const char *func_name;
         const char *probe_name;
@@ -498,26 +670,74 @@ int main(int argc, char **argv)
         {"cudaLaunchKernel", "trace_cuda_launch_return"},
         {"cudaDeviceSynchronize", "trace_cuda_sync_entry"},
         {"cudaDeviceSynchronize", "trace_cuda_sync_return"},
+        /* Async / stream-aware (new) */
+        {"cudaMemcpyAsync", "trace_cuda_memcpy_async_entry"},
+        {"cudaMemcpyAsync", "trace_cuda_memcpy_async_return"},
+        {"cudaStreamSynchronize", "trace_cuda_stream_sync_entry"},
+        {"cudaStreamSynchronize", "trace_cuda_stream_sync_return"},
+        {"cudaStreamCreate", "trace_cuda_stream_create_entry"},
+        {"cudaStreamCreate", "trace_cuda_stream_create_return"},
+        {"cudaStreamDestroy", "trace_cuda_stream_destroy_entry"},
+        {"cudaStreamDestroy", "trace_cuda_stream_destroy_return"},
+        {"cudaEventRecord", "trace_cuda_event_record_entry"},
+        {"cudaEventRecord", "trace_cuda_event_record_return"},
+        {"cudaEventSynchronize", "trace_cuda_event_sync_entry"},
+        {"cudaEventSynchronize", "trace_cuda_event_sync_return"},
+        {"cudaEventQuery", "trace_cuda_event_query_entry"},
+        {"cudaEventQuery", "trace_cuda_event_query_return"},
+        {"cudaLaunchKernelExC", "trace_cuda_launch_ex_entry"},
+        {"cudaLaunchKernelExC", "trace_cuda_launch_ex_return"},
+        {"cudaGraphLaunch", "trace_cuda_graph_launch_entry"},
+        {"cudaGraphLaunch", "trace_cuda_graph_launch_return"},
     };
     
     int gpu_link_count = 0;
-    for (int i = 0; i < sizeof(cuda_funcs) / sizeof(cuda_funcs[0]); i++) {
+    const int gpu_links_cap = (int)(sizeof(gpu_links) / sizeof(gpu_links[0]));
+    for (int i = 0; i < (int)(sizeof(cuda_funcs) / sizeof(cuda_funcs[0])); i++) {
+        if (gpu_link_count >= gpu_links_cap) {
+            fprintf(stderr, "WARNING: gpu_links[] full; %d more probes skipped\n",
+                    (int)(sizeof(cuda_funcs)/sizeof(cuda_funcs[0])) - i);
+            break;
+        }
         prog = bpf_object__find_program_by_name(gpu_obj, cuda_funcs[i].probe_name);
         if (!prog) continue;
-        
+
         bool is_retprobe = strstr(cuda_funcs[i].probe_name, "return") != NULL;
         LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts,
             .func_name = cuda_funcs[i].func_name,
             .retprobe = is_retprobe,
         );
-        
+
         gpu_links[gpu_link_count] = bpf_program__attach_uprobe_opts(
             prog, -1, cuda_lib_path, 0, &uprobe_opts);
-        
+
         if (!libbpf_get_error(gpu_links[gpu_link_count]))
             gpu_link_count++;
     }
     printf("✓ Attached %d CUDA uprobes\n", gpu_link_count);
+
+    /* Initialize symbolizer. Safe to call even if --no-symbolize is set;
+     * we just skip the bsw_resolve path at JSON-emit time.
+     */
+    if (symbolize_enabled) {
+        symbolizer = bsw_new();
+        if (!symbolizer) {
+            fprintf(stderr, "WARNING: bsw_new() failed; falling back to raw addresses in JSON output\n");
+            symbolize_enabled = 0;
+        } else {
+            char ver[64] = "?";
+            bsw_version(ver, sizeof(ver));
+            printf("✓ blazesym symbolizer ready (v%s)\n", ver);
+        }
+    } else {
+        printf("ℹ blazesym symbolization disabled (--no-symbolize)\n");
+    }
+    if (!capture_stacks_cli) {
+        printf("ℹ stack capture disabled (--no-stacks); stacks will be omitted\n");
+    } else {
+        printf("ℹ stack sampling: sync=1/%d  async=1/%d  (use --stack-sample-{sync,async} to tune)\n",
+               sample_period_sync, sample_period_async);
+    }
     
     /* Set up ring buffers */
     cpu_map_fd = bpf_object__find_map_fd_by_name(cpu_obj, "cpu_events");
@@ -574,10 +794,14 @@ cleanup:
     ring_buffer__free(gpu_rb);
     bpf_link__destroy(sched_switch_link);
     bpf_link__destroy(sched_wakeup_link);
-    for (int i = 0; i < 12; i++)
+    for (int i = 0; i < (int)(sizeof(gpu_links)/sizeof(gpu_links[0])); i++)
         bpf_link__destroy(gpu_links[i]);
     bpf_object__close(cpu_obj);
     bpf_object__close(gpu_obj);
-    
+    if (symbolizer) {
+        bsw_free(symbolizer);
+        symbolizer = NULL;
+    }
+
     return 0;
 }

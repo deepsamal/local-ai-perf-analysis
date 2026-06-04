@@ -5,6 +5,19 @@ obj/
 *.so
 *.a
 
+# Cargo / Rust (src/symbolize/)
+src/symbolize/target/
+src/symbolize/Cargo.lock
+
+# Test artifacts
+tests/mock/libfake_cudart.so
+tests/mock/workload
+tests/unit/test_event_sort
+tests/unit/test_chrome_json
+/tmp/mock_trace.json
+/tmp/python_agent_trace.json
+/tmp/gpu_trace.json
+
 # Editor files
 *.swp
 *.swo
