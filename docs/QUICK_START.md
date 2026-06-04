@@ -98,15 +98,66 @@ Three patterns to look for:
 | `gpu_xfer` row longer than `gpu_compute` | Transfer-bound | Use pinned memory; reduce data movement |
 | Many short `gpu_compute` rows in series | Kernel-launch overhead | Batch ops; use CUDA Graphs |
 
+## Common gotchas (read this before opening an issue)
+
+### 0 GPU events when the binary uses CUDA → check static cudart
+
+This is the most common reason a real-CUDA workload produces no events even though uprobes attach cleanly. `nvcc` defaults to **static** cudart linkage (`libcudart_static.a` embedded into the binary), which means the binary never loads `libcudart.so` at all — so uprobes on it can't fire.
+
+Diagnose:
+
+```bash
+ldd ./your_cuda_binary | grep cudart
+# empty output ⇒ statically linked ⇒ tool can't see it
+# a path ⇒ dynamically linked ⇒ tool can attach to that exact .so
+```
+
+Fix for your own CUDA code:
+
+```bash
+nvcc --cudart=shared your_program.cu -o your_program
+```
+
+Or via CMake:
+
+```cmake
+set_target_properties(your_target PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+```
+
+You almost never hit this with **PyTorch, vLLM, llama.cpp, transformers, TensorRT-LLM, ollama** — they all link cudart shared by default. The trap is hand-compiled CUDA examples or custom build systems.
+
+If you can't recompile the target (e.g. it's a vendor binary), this tool can't trace it as-is. Workarounds: use Nsight Systems for that case, or wrap the binary's `__libc_start_main` with `LD_PRELOAD` to inject a shared cudart.
+
+### `sudo` strips your PATH so cargo "disappears"
+
+If you build the tool as your user (`make`) then run with `sudo make test`, sudo's default `secure_path` excludes `$HOME/.cargo/bin`. The Makefile detects no cargo and silently re-links `unified_trace` against a NULL-returning stub, which surfaces as `WARNING: bsw_new() failed`.
+
+Always run sudo invocations with PATH preserved:
+
+```bash
+sudo -E env "PATH=$PATH" make test
+```
+
+The Makefile has a guard that uses the existing `.a` if present even when cargo isn't on PATH, but the `-E env PATH` habit makes it bulletproof.
+
+### Workload finishes before uprobes attach
+
+Attaching 28 uprobes takes ~500–1000 ms. A short CUDA program (e.g. the bundled `examples/cuda_test.cu`) can complete in less time than that, so events are missed. Two patterns work:
+
+1. **Long-running workload** — sleep or warmup loop for 3+ seconds before doing CUDA work. The mock workload does this.
+2. **Tracer-first ordering** — start the tracer system-wide (no `--pid`), wait 3 seconds, *then* launch the workload. This is what `tests/e2e/run_gpu.sh` does.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `ERROR: CUDA library not found` | libcudart in a non-standard path | `--cuda-lib /path/to/libcudart.so` |
-| No GPU events in JSON | Probes didn't attach (CUDA stripped symbols, wrong arch) | Check `nm -D /path/to/libcudart.so \| grep cuda` |
-| Stacks show only `lib+0x...` | blazesym not linked, or process exited before resolution | Build with cargo present; keep target PID alive past tracer stop |
+| No GPU events in JSON, uprobes attached | **Static cudart linkage** (see above) or workload finished before attach | `ldd binary \| grep cudart` to confirm; recompile with `--cudart=shared` |
+| `WARNING: bsw_new() failed` | sudo stripped PATH, stub linked | `sudo -E env "PATH=$PATH" make test` |
+| Stacks show only `addr` / hex addresses | blazesym not linked, or process exited before resolution | Build with cargo present; keep target PID alive past tracer stop |
 | Python stacks show `_PyEval_EvalFrameDefault` everywhere | `PYTHONPERFSUPPORT=1` was missing | Set env var before `python3 ...` |
 | Permission errors / "operation not permitted" | Need root for eBPF | `sudo` or `setcap cap_bpf,cap_perfmon=ep ./bin/unified_trace` |
+| `failed to load CPU BPF object: -22` | `/sys/fs/bpf` not mounted (pinned-map dependency) | `sudo mount -t bpf bpf /sys/fs/bpf` |
 
 ## Next steps
 
