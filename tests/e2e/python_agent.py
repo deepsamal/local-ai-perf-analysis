@@ -72,6 +72,20 @@ def main() -> int:
             print(f"AGENT_FINAL={float(y.detach().cpu())}", flush=True)
     elapsed = time.perf_counter() - t0
     print(f"AGENT_DONE iters={iters} elapsed_s={elapsed:.3f}", flush=True)
+
+    # CRITICAL: don't exit yet. The tracer is still collecting events,
+    # and after it stops it needs to symbolize captured stacks by reading
+    # /proc/<our_pid>/maps + /tmp/perf-<our_pid>.map. If we exit, /proc
+    # is gone and blazesym returns 0 frames → empty stacks in the JSON.
+    #
+    # Stay alive until the test driver kills us (SIGTERM/SIGINT). We
+    # idle in small sleeps so a fast Ctrl+C is responsive.
+    print("AGENT_IDLE waiting_for_kill", flush=True)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
     return 0
 
 

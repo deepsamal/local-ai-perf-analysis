@@ -12,10 +12,29 @@
 //! All of which we want — but the project is C, so we expose a minimal C ABI
 //! and link the result as a static library.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::slice;
+use std::sync::Mutex;
+
+// Track which PIDs we've already logged an error for, so we don't
+// spam stderr with one line per captured frame when a process exited
+// before symbolization. Reset on bsw_free.
+static LOGGED_ERR_PIDS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+fn already_logged(pid: u32) -> bool {
+    let mut guard = LOGGED_ERR_PIDS.lock().unwrap_or_else(|p| p.into_inner());
+    let set = guard.get_or_insert_with(HashSet::new);
+    !set.insert(pid)
+}
+
+fn reset_logged() {
+    if let Ok(mut guard) = LOGGED_ERR_PIDS.lock() {
+        *guard = None;
+    }
+}
 
 use blazesym::symbolize::source::{Process, Source};
 use blazesym::symbolize::{Input, Sym, Symbolized, Symbolizer};
@@ -107,6 +126,7 @@ pub unsafe extern "C" fn bsw_free(sym: *mut Symbolizer) {
     if !sym.is_null() {
         drop(Box::from_raw(sym));
     }
+    reset_logged();
 }
 
 /// Resolve up to `out_cap` frames from a list of `n` user-space addresses
@@ -137,14 +157,29 @@ pub unsafe extern "C" fn bsw_resolve(
     let addrs_slice = slice::from_raw_parts(addrs, n);
     let out_slice = slice::from_raw_parts_mut(out, out_cap);
 
-    let src = Source::Process(Process::new(Pid::from(pid)));
+    // Configure the Process source. Critical bits for AI workloads:
+    //   - map_files: canonicalize paths via /proc/<pid>/map_files
+    //   - perf_map: read /tmp/perf-<pid>.map for JIT'd Python frames
+    //     (Python 3.12 -X perf)
+    //
+    // These are direct public fields on Process in blazesym 0.2.x.
+    let mut process = Process::new(Pid::from(pid));
+    process.map_files = true;
+    process.perf_map = true;
+    let src = Source::Process(process);
+
     // BPF stack frames are absolute addresses in the target process's
     // virtual address space, so Input::AbsAddr is the right variant.
-    // (Input::VirtOffset is for ELF-relative offsets; FileOffset for
-    // raw file offsets — both wrong here.)
     let results = match symbolizer.symbolize(&src, Input::AbsAddr(addrs_slice)) {
         Ok(r) => r,
-        Err(_) => return 0,
+        Err(e) => {
+            // Only log the first error per PID. The common case is "process
+            // already exited" and one line per missing PID is enough info.
+            if !already_logged(pid) {
+                eprintln!("bsw_resolve: blazesym error for pid={}: {:#}", pid, e);
+            }
+            return 0;
+        }
     };
 
     let mut written = 0usize;

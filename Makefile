@@ -145,10 +145,23 @@ test-gpu: all
 	@bash $(TEST_DIR)/e2e/run_gpu.sh
 
 test-python: all
-	@if ! python3 -c "import torch" 2>/dev/null; then \
-		echo "SKIP: python3 + torch not available"; exit 0; \
-	fi
-	@bash $(TEST_DIR)/e2e/run_python_agent.sh
+	@# Critical: each Make recipe line is its own shell — `exit 0` inside
+	@# the if/fi only exits that shell, not the recipe. So we either
+	@# inline everything into one shell, or invert the guard into the
+	@# bash script. Inlining is simpler.
+	@# Also: when running under sudo, torch installed via `pip install
+	@# --user` lives in the original user's home. We probe via
+	@# `sudo -u $$SUDO_USER` so the check sees the user-installed torch.
+	@if [ -n "$$SUDO_USER" ]; then \
+	     PYCHECK="sudo -u $$SUDO_USER python3"; \
+	else \
+	     PYCHECK="python3"; \
+	fi; \
+	if ! $$PYCHECK -c "import torch" 2>/dev/null; then \
+	     echo "SKIP: python3 + torch not available (as user $${SUDO_USER:-$$USER})"; \
+	     exit 0; \
+	fi; \
+	bash $(TEST_DIR)/e2e/run_python_agent.sh
 
 bench: all mock
 	@bash $(TEST_DIR)/e2e/run_mock.sh --bench

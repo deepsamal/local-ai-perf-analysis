@@ -100,19 +100,45 @@ Three patterns to look for:
 
 ## Common gotchas (read this before opening an issue)
 
-### 0 GPU events when the binary uses CUDA → check static cudart
+### 0 GPU events when the workload uses CUDA → wrong libcudart
 
-This is the most common reason a real-CUDA workload produces no events even though uprobes attach cleanly. `nvcc` defaults to **static** cudart linkage (`libcudart_static.a` embedded into the binary), which means the binary never loads `libcudart.so` at all — so uprobes on it can't fire.
+If uprobes attach cleanly but you see 0 GPU events, the workload is almost certainly using a *different* `libcudart` than the one you attached to. Three common variants:
 
-Diagnose:
+**(a) Static cudart linkage (typical for hand-compiled CUDA examples).** `nvcc` defaults to embedding `libcudart_static.a` into the binary, which means `libcudart.so` is never loaded.
+
+**(b) Bundled cudart inside a Python wheel.** PyTorch, TensorFlow, JAX, and most CUDA-enabled wheels ship their *own* libcudart inside `site-packages/<pkg>/lib/`. When the package is imported, it dlopens that bundled copy and never touches the system `/usr/local/cuda/lib64/libcudart.so`.
+
+**(c) Multiple system libcudart installs.** A binary might link against `/usr/lib/x86_64-linux-gnu/libcudart.so.11` while you attached to `/usr/local/cuda-12.6/.../libcudart.so.12`.
+
+Diagnose — **for a compiled binary**:
 
 ```bash
 ldd ./your_cuda_binary | grep cudart
-# empty output ⇒ statically linked ⇒ tool can't see it
+# empty output ⇒ statically linked (case a) ⇒ tool can't see it
 # a path ⇒ dynamically linked ⇒ tool can attach to that exact .so
 ```
 
-Fix for your own CUDA code:
+Diagnose — **for a Python process**:
+
+```bash
+# Find the actual libcudart torch/tf/jax loaded:
+python -c "
+import torch, os
+print(os.path.join(os.path.dirname(torch.__file__), 'lib'))
+"
+ls $(python -c "import torch, os; print(os.path.dirname(torch.__file__))")/lib/libcudart*
+```
+
+Then pass that exact path to `--cuda-lib`:
+
+```bash
+TORCH_CUDART=$(python -c "import torch, os, glob; \
+    p = glob.glob(os.path.join(os.path.dirname(torch.__file__), 'lib', 'libcudart.so*'))[0]; \
+    print(p)")
+sudo ./bin/unified_trace --pid $PYTHON_PID --cuda-lib "$TORCH_CUDART" --duration 30 --output trace.json
+```
+
+**Fix for your own CUDA code** (case a):
 
 ```bash
 nvcc --cudart=shared your_program.cu -o your_program
@@ -124,9 +150,11 @@ Or via CMake:
 set_target_properties(your_target PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 ```
 
-You almost never hit this with **PyTorch, vLLM, llama.cpp, transformers, TensorRT-LLM, ollama** — they all link cudart shared by default. The trap is hand-compiled CUDA examples or custom build systems.
-
-If you can't recompile the target (e.g. it's a vendor binary), this tool can't trace it as-is. Workarounds: use Nsight Systems for that case, or wrap the binary's `__libc_start_main` with `LD_PRELOAD` to inject a shared cudart.
+**Notes:**
+- `tests/e2e/run_python_agent.sh` already does the torch-lib discovery automatically — that script is the reference implementation.
+- vLLM and TensorRT-LLM also bundle libcudart; same technique applies.
+- llama.cpp and ollama (C++) link cudart shared by default, so they work without intervention.
+- If you can't recompile the target (e.g. it's a vendor binary statically linked), this tool can't trace it as-is. Workarounds: use Nsight Systems for that case, or `LD_PRELOAD` a shared cudart.
 
 ### `sudo` strips your PATH so cargo "disappears"
 
@@ -158,6 +186,36 @@ Attaching 28 uprobes takes ~500–1000 ms. A short CUDA program (e.g. the bundle
 | Python stacks show `_PyEval_EvalFrameDefault` everywhere | `PYTHONPERFSUPPORT=1` was missing | Set env var before `python3 ...` |
 | Permission errors / "operation not permitted" | Need root for eBPF | `sudo` or `setcap cap_bpf,cap_perfmon=ep ./bin/unified_trace` |
 | `failed to load CPU BPF object: -22` | `/sys/fs/bpf` not mounted (pinned-map dependency) | `sudo mount -t bpf bpf /sys/fs/bpf` |
+
+## Known issues
+
+### PyTorch + Python 3.12 `-X perf` on WSL2 — Python frames unresolved
+
+Status: partial. The CUDA + stack-capture pipeline is fully validated against
+real NVIDIA libcudart (`make test-gpu`). What's not yet working: when a
+PyTorch agent runs under Python 3.12 with `-X perf` on WSL2, captured CUDA
+events attribute to a different PID than `os.getpid()` reports for the agent,
+breaking the perf-map → Python frame resolution chain.
+
+Possible causes (not yet isolated):
+
+- PyTorch's CUDA caching allocator may issue calls from a worker context that
+  the kernel sees under a different TGID. The Python interpreter's PID and
+  the calling thread's PID upper-32 should be equal under POSIX threads, but
+  CUDA library internals may not use plain pthreads.
+- `-X perf`'s trampoline mechanism in Python 3.12 may interact with torch
+  in a way that obscures the calling stack.
+- The cu126 torch wheel on WSL2 with the bundled driver stub appears
+  unstable for some operations, which makes longer-running test agents
+  hard to keep alive for symbolization.
+
+Workaround: use `make test-gpu` (vanilla CUDA program with `--cudart=shared`)
+to validate the full stack-attribution pipeline; that path is fully working
+on the same machine.
+
+Re-investigation path: reproduce on a non-WSL Linux box with a more
+current NVIDIA driver, or with `cu118` wheel, to rule out the WSL2 +
+cu126 + driver-mismatch combination as the cause.
 
 ## Next steps
 

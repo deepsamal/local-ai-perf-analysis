@@ -151,9 +151,22 @@ def main() -> int:
                 )
             print(f"INFO: {m} appeared in {count} stacks")
 
-    # ---- spot-check: at least one event has a stack, if any do ----
-    with_stack = sum(1 for e in real if "stack" in (e.get("args") or {}))
-    print(f"INFO: {with_stack} events carry a 'stack' field")
+    # ---- spot-check: at least one event has a non-empty stack ----
+    # Distinguish "stack key present but empty []" (symbolization failure,
+    # usually because the target process exited before we tried to resolve)
+    # from "stack key present with frames" (working).
+    with_key = sum(1 for e in real if "stack" in (e.get("args") or {}))
+    with_frames = sum(
+        1 for e in real
+        if isinstance((e.get("args") or {}).get("stack"), list)
+        and len((e["args"]["stack"])) > 0
+    )
+    print(f"INFO: {with_key} events have a 'stack' field; {with_frames} have non-empty stacks")
+    if with_key > 0 and with_frames == 0:
+        print("WARN: every captured stack symbolized to zero frames. Common causes:")
+        print("      - Target process exited before symbolization (keep it alive past tracer stop)")
+        print("      - blazesym was the stub (run with sudo -E env PATH=$PATH)")
+        print("      - PID mismatch: symbolizing for the wrong PID (sudo wrapper vs python)")
 
     print("OK validate_trace")
     return 0
