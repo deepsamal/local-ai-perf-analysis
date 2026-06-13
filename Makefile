@@ -163,6 +163,22 @@ test-python: all
 	fi; \
 	bash $(TEST_DIR)/e2e/run_python_agent.sh
 
+# Synthetic agent — single reproducible workload that exercises every
+# bottleneck class (GPU, network, disk, subprocess). Runs the phased
+# validator and writes docs/STATE_REPORT.md. This is the unit of
+# measurement for the roadmap — see docs/ROADMAP.md.
+test-synthetic: all
+	@if [ -n "$$SUDO_USER" ]; then \
+	     PYCHECK="sudo -u $$SUDO_USER python3"; \
+	else \
+	     PYCHECK="python3"; \
+	fi; \
+	if ! $$PYCHECK -c "import torch" 2>/dev/null; then \
+	     echo "SKIP: python3 + torch not available"; \
+	     exit 0; \
+	fi; \
+	bash $(TEST_DIR)/e2e/synthetic_agent/run.sh
+
 bench: all mock
 	@bash $(TEST_DIR)/e2e/run_mock.sh --bench
 
