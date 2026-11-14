@@ -15,7 +15,15 @@
  * the thread blocked. (The old code captured on the ON event, which
  * recorded prev's stack but attributed it to next.)
  *
- * Requires kernel BTF (/sys/kernel/btf/vmlinux), kernel >= 5.5.
+ * Records are built in a stack-local struct and copied with
+ * bpf_ringbuf_output() rather than written in place after
+ * bpf_ringbuf_reserve(). The WSL2 toolchain (Ubuntu 22.04 clang) dropped
+ * every plain store into reserved ringbuf memory on the OFF path -- only
+ * the comm string copy survived, so OFF records arrived all-zero. Stores
+ * to a stack object passed to a helper can't be elided.
+ *
+ * Requires kernel BTF (/sys/kernel/btf/vmlinux) and kernel >= 5.14
+ * (task_struct.__state).
  *
  * clang -target bpf defines __BPF__ automatically; common.h and maps.h
  * both gate BPF-only blocks on that macro.
@@ -37,11 +45,6 @@ struct task_struct {
     int tgid;           /* thread-group id == user-visible process id */
     unsigned int __state;
     char comm[16];
-} __attribute__((preserve_access_index));
-
-/* Pre-5.14 kernels name the field `state` (long). */
-struct task_struct___pre514 {
-    long state;
 } __attribute__((preserve_access_index));
 
 /* Ring buffer for CPU scheduling events. Larger than before because
@@ -89,19 +92,17 @@ static __always_inline void count_drop(void)
         (*v)++;
 }
 
-static __always_inline __u64 task_state(struct task_struct *t)
+static __always_inline void emit(struct cpu_sched_event *ev)
 {
-    if (bpf_core_field_exists(t->__state))
-        return BPF_CORE_READ(t, __state);
-    struct task_struct___pre514 *old = (void *)t;
-    return (__u64)BPF_CORE_READ(old, state);
+    if (bpf_ringbuf_output(&cpu_events, ev, sizeof(*ev), 0) != 0)
+        count_drop();
 }
 
 SEC("tp_btf/sched_switch")
 int BPF_PROG(trace_sched_switch, _Bool preempt,
              struct task_struct *prev, struct task_struct *next)
 {
-    struct cpu_sched_event *event;
+    struct cpu_sched_event ev;
     __u32 prev_tid  = BPF_CORE_READ(prev, pid);
     __u32 prev_tgid = BPF_CORE_READ(prev, tgid);
     __u32 next_tid  = BPF_CORE_READ(next, pid);
@@ -111,46 +112,37 @@ int BPF_PROG(trace_sched_switch, _Bool preempt,
 
     /* prev going OFF CPU. tid 0 is the idle task; skip it. */
     if (prev_tid != 0 && wanted(prev_tgid)) {
-        event = bpf_ringbuf_reserve(&cpu_events, sizeof(*event), 0);
-        if (event) {
-            __u64 st = task_state(prev);
-            event->timestamp  = now;
-            event->event_type = CPU_SCHED_OFF;
-            event->pid        = prev_tgid;
-            event->tid        = prev_tid;
-            event->cpu        = cpu;
-            event->prev_state = st;
-            event->stack_id   = -1;
-            /* Only voluntary (blocking) switches carry a useful "why am I
-             * waiting" stack; st == 0 means preempted while runnable.
-             * Stacks are skipped in system-wide mode to bound overhead.
-             */
-            if (cfg.offcpu_stacks && cfg.target_tgid != 0 && st != 0)
-                event->stack_id = bpf_get_stackid(ctx, &stack_traces,
-                        BPF_F_USER_STACK | BPF_F_FAST_STACK_CMP);
-            BPF_CORE_READ_STR_INTO(&event->comm, prev, comm);
-            bpf_ringbuf_submit(event, 0);
-        } else {
-            count_drop();
-        }
+        __u64 st = BPF_CORE_READ(prev, __state);
+        __builtin_memset(&ev, 0, sizeof(ev));
+        ev.timestamp  = now;
+        ev.event_type = CPU_SCHED_OFF;
+        ev.pid        = prev_tgid;
+        ev.tid        = prev_tid;
+        ev.cpu        = cpu;
+        ev.prev_state = st;
+        ev.stack_id   = -1;
+        /* Only voluntary (blocking) switches carry a useful "why am I
+         * waiting" stack; st == 0 means preempted while runnable.
+         * Stacks are skipped in system-wide mode to bound overhead.
+         */
+        if (cfg.offcpu_stacks && cfg.target_tgid != 0 && st != 0)
+            ev.stack_id = bpf_get_stackid(ctx, &stack_traces,
+                    BPF_F_USER_STACK | BPF_F_FAST_STACK_CMP);
+        BPF_CORE_READ_STR_INTO(&ev.comm, prev, comm);
+        emit(&ev);
     }
 
     /* next coming ON CPU. No stack: `current` is still prev here. */
     if (next_tid != 0 && wanted(next_tgid)) {
-        event = bpf_ringbuf_reserve(&cpu_events, sizeof(*event), 0);
-        if (event) {
-            event->timestamp  = now;
-            event->event_type = CPU_SCHED_ON;
-            event->pid        = next_tgid;
-            event->tid        = next_tid;
-            event->cpu        = cpu;
-            event->prev_state = 0;
-            event->stack_id   = -1;
-            BPF_CORE_READ_STR_INTO(&event->comm, next, comm);
-            bpf_ringbuf_submit(event, 0);
-        } else {
-            count_drop();
-        }
+        __builtin_memset(&ev, 0, sizeof(ev));
+        ev.timestamp  = now;
+        ev.event_type = CPU_SCHED_ON;
+        ev.pid        = next_tgid;
+        ev.tid        = next_tid;
+        ev.cpu        = cpu;
+        ev.stack_id   = -1;
+        BPF_CORE_READ_STR_INTO(&ev.comm, next, comm);
+        emit(&ev);
     }
     return 0;
 }
@@ -164,20 +156,15 @@ int BPF_PROG(trace_sched_wakeup, struct task_struct *p)
     if (tid == 0 || !wanted(tgid))
         return 0;
 
-    struct cpu_sched_event *event =
-        bpf_ringbuf_reserve(&cpu_events, sizeof(*event), 0);
-    if (!event) {
-        count_drop();
-        return 0;
-    }
-    event->timestamp  = bpf_ktime_get_ns();
-    event->event_type = CPU_SCHED_WAKEUP;
-    event->pid        = tgid;
-    event->tid        = tid;
-    event->cpu        = bpf_get_smp_processor_id();
-    event->prev_state = 0;
-    event->stack_id   = -1;
-    BPF_CORE_READ_STR_INTO(&event->comm, p, comm);
-    bpf_ringbuf_submit(event, 0);
+    struct cpu_sched_event ev;
+    __builtin_memset(&ev, 0, sizeof(ev));
+    ev.timestamp  = bpf_ktime_get_ns();
+    ev.event_type = CPU_SCHED_WAKEUP;
+    ev.pid        = tgid;
+    ev.tid        = tid;
+    ev.cpu        = bpf_get_smp_processor_id();
+    ev.stack_id   = -1;
+    BPF_CORE_READ_STR_INTO(&ev.comm, p, comm);
+    emit(&ev);
     return 0;
 }

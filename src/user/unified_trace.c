@@ -176,6 +176,22 @@ static int handle_cpu_event(void *ctx, void *data, size_t data_sz)
         return 0;
     
     struct cpu_sched_event *e = data;
+
+    /* --verbose: dump the first few malformed records (size/type/ts) so
+     * kernel- or layout-specific corruption is diagnosable from a log. */
+    static int bad_dumped = 0;
+    if (verbose && bad_dumped < 6 &&
+        (data_sz != sizeof(*e) || e->event_type < CPU_SCHED_ON ||
+         e->event_type > CPU_SCHED_WAKEUP || e->timestamp == 0)) {
+        const unsigned char *b = data;
+        fprintf(stderr, "DEBUG bad cpu record: size=%zu (expect %zu) type=%u ts=%llu pid=%u tid=%u state=%llu stack=%d bytes:",
+                data_sz, sizeof(*e), e->event_type, (unsigned long long)e->timestamp,
+                e->pid, e->tid, (unsigned long long)e->prev_state, e->stack_id);
+        for (size_t k = 0; k < data_sz && k < 64; k++)
+            fprintf(stderr, "%s%02x", (k % 8) ? "" : " ", b[k]);
+        fprintf(stderr, "\n");
+        bad_dumped++;
+    }
     events[event_count].timestamp = e->timestamp;
     events[event_count].type = 0; /* CPU */
     events[event_count].cpu = *e;
