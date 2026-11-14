@@ -99,6 +99,11 @@ struct pt_regs {
 
 /* Common definitions shared between BPF and user-space programs */
 
+/* Ids of tasks NOT visible in the tracer's pid namespace are reported as
+ * root-namespace id + this base (pid_max is <= 2^22, so no collisions).
+ * See include/pidns.h. */
+#define PID_OUTSIDE_NS_BASE (1u << 30)
+
 #define TASK_COMM_LEN 16
 #define MAX_FILENAME_LEN 256
 
@@ -184,6 +189,8 @@ struct cuda_call_info {
     __u64 stream_id;     /* captured at entry, forwarded to event on return */
     __s32 stack_id;      /* captured at entry on submitting thread */
     __u32 flags;
+    __u32 tid;           /* namespace-translated thread id, captured at entry */
+    __u32 _pad;
 };
 
 /* Data structure for CPU scheduling events */

@@ -36,16 +36,7 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-/* Minimal CO-RE view of task_struct. preserve_access_index makes libbpf
- * relocate field offsets against the running kernel's BTF, so we don't
- * need vmlinux.h.
- */
-struct task_struct {
-    int pid;            /* kernel task id == user-visible thread id */
-    int tgid;           /* thread-group id == user-visible process id */
-    unsigned int __state;
-    char comm[16];
-} __attribute__((preserve_access_index));
+#include "pidns.h" /* CO-RE task_struct + pid-namespace translation */
 
 /* Ring buffer for CPU scheduling events. Larger than before because
  * system-wide mode (target_tgid == 0) emits two events per switch.
@@ -65,23 +56,33 @@ struct {
     __type(value, __u64);
 } cpu_drops SEC(".maps");
 
-/* Knobs, set from user space via .rodata before load. Single struct for
- * a deterministic layout (clang may reorder separate globals); the same
- * definition is mirrored in unified_trace.c.
- */
+/* Knobs, read from the sched_cfg map below; mirrored in unified_trace.c. */
 struct sched_tracer_cfg {
-    __u32 target_tgid;     /* 0 = all processes */
+    __u32 target_tgid;     /* 0 = all processes; in the tracer's pid namespace */
     __u8  offcpu_stacks;   /* capture user stack on blocking switch-outs */
     __u8  _pad[3];
+    __u32 pidns_inum;      /* tracer's pid-namespace inode; 0 = no translation */
+    __u32 _pad2;
 };
-const volatile struct sched_tracer_cfg cfg = {
-    .target_tgid   = 0,
-    .offcpu_stacks = 1,
-};
+/* Config in a one-entry array map, filled by user space after load and
+ * before attach. Not `const volatile` .rodata: clang 10 constant-folds
+ * those struct members to their initializers (see trace_cuda.bpf.c). */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct sched_tracer_cfg);
+} sched_cfg SEC(".maps");
 
-static __always_inline int wanted(__u32 tgid)
+static __always_inline struct sched_tracer_cfg *get_cfg(void)
 {
-    return cfg.target_tgid == 0 || tgid == cfg.target_tgid;
+    __u32 k = 0;
+    return bpf_map_lookup_elem(&sched_cfg, &k);
+}
+
+static __always_inline int wanted(struct sched_tracer_cfg *cfgp, __u32 tgid)
+{
+    return cfgp->target_tgid == 0 || tgid == cfgp->target_tgid;
 }
 
 static __always_inline void count_drop(void)
@@ -102,16 +103,21 @@ SEC("tp_btf/sched_switch")
 int BPF_PROG(trace_sched_switch, _Bool preempt,
              struct task_struct *prev, struct task_struct *next)
 {
+    struct sched_tracer_cfg *cfgp = get_cfg();
+    if (!cfgp)
+        return 0;
     struct cpu_sched_event ev;
-    __u32 prev_tid  = BPF_CORE_READ(prev, pid);
-    __u32 prev_tgid = BPF_CORE_READ(prev, tgid);
-    __u32 next_tid  = BPF_CORE_READ(next, pid);
-    __u32 next_tgid = BPF_CORE_READ(next, tgid);
+    __u32 prev_tid, prev_tgid, next_tid, next_tgid;
+    /* Global tid 0 is the idle task; skip it before translating. */
+    int prev_idle = BPF_CORE_READ(prev, pid) == 0;
+    int next_idle = BPF_CORE_READ(next, pid) == 0;
+    task_ids_ns(prev, cfgp->pidns_inum, &prev_tgid, &prev_tid);
+    task_ids_ns(next, cfgp->pidns_inum, &next_tgid, &next_tid);
     __u64 now = bpf_ktime_get_ns();
     __u32 cpu = bpf_get_smp_processor_id();
 
-    /* prev going OFF CPU. tid 0 is the idle task; skip it. */
-    if (prev_tid != 0 && wanted(prev_tgid)) {
+    /* prev going OFF CPU. */
+    if (!prev_idle && wanted(cfgp, prev_tgid)) {
         __u64 st = BPF_CORE_READ(prev, __state);
         __builtin_memset(&ev, 0, sizeof(ev));
         ev.timestamp  = now;
@@ -125,7 +131,7 @@ int BPF_PROG(trace_sched_switch, _Bool preempt,
          * waiting" stack; st == 0 means preempted while runnable.
          * Stacks are skipped in system-wide mode to bound overhead.
          */
-        if (cfg.offcpu_stacks && cfg.target_tgid != 0 && st != 0)
+        if (cfgp->offcpu_stacks && cfgp->target_tgid != 0 && st != 0)
             ev.stack_id = bpf_get_stackid(ctx, &stack_traces,
                     BPF_F_USER_STACK | BPF_F_FAST_STACK_CMP);
         BPF_CORE_READ_STR_INTO(&ev.comm, prev, comm);
@@ -133,7 +139,7 @@ int BPF_PROG(trace_sched_switch, _Bool preempt,
     }
 
     /* next coming ON CPU. No stack: `current` is still prev here. */
-    if (next_tid != 0 && wanted(next_tgid)) {
+    if (!next_idle && wanted(cfgp, next_tgid)) {
         __builtin_memset(&ev, 0, sizeof(ev));
         ev.timestamp  = now;
         ev.event_type = CPU_SCHED_ON;
@@ -150,10 +156,15 @@ int BPF_PROG(trace_sched_switch, _Bool preempt,
 SEC("tp_btf/sched_wakeup")
 int BPF_PROG(trace_sched_wakeup, struct task_struct *p)
 {
-    __u32 tid  = BPF_CORE_READ(p, pid);
-    __u32 tgid = BPF_CORE_READ(p, tgid);
+    struct sched_tracer_cfg *cfgp = get_cfg();
+    if (!cfgp)
+        return 0;
+    __u32 tid, tgid;
+    if (BPF_CORE_READ(p, pid) == 0)
+        return 0;
+    task_ids_ns(p, cfgp->pidns_inum, &tgid, &tid);
 
-    if (tid == 0 || !wanted(tgid))
+    if (!wanted(cfgp, tgid))
         return 0;
 
     struct cpu_sched_event ev;

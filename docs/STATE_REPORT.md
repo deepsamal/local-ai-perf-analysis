@@ -5,16 +5,18 @@ Snapshot of what the tool currently captures vs. what it misses,
 measured against a fixed synthetic agent workload.
 
 **Trace source:** `/tmp/synthetic_trace.json`
-**Trace events:** 101 total, 101 non-metadata
+**Trace events:** 15063 total, 15061 non-metadata
 **Iterations:** 10
 
 ## Captured
 
-- Categories: `['gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer']`
+- Categories: `['cpu', 'cpu_off', 'cpu_runq', 'gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer']`
 - GPU events: 101
-- CPU events: 0
+- CPU events: 11241
 - Stack arrays attempted: 71
-- Stack arrays non-empty (blazesym resolved): 0
+- Stack arrays non-empty (blazesym resolved): 71
+- Stack lookups failed (stack map problem): 0
+- Stacks found but unsymbolized (blazesym/pid problem): 0
 
 ## Per-phase assertion status
 
@@ -22,11 +24,11 @@ measured against a fixed synthetic agent workload.
 
 | Status | Assertion | Detail |
 |---|---|---|
-| PASS | trace contains events | 101 non-metadata events |
-| PASS | trace has GPU compute category | categories seen: ['gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer'] |
+| PASS | trace contains events | 15061 non-metadata events |
+| PASS | trace has GPU compute category | categories seen: ['cpu', 'cpu_off', 'cpu_runq', 'gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer'] |
 | PASS | trace has at least 20 GPU events | counted 101 gpu events |
 | PASS | trace has stack arrays | 71 events have a 'stack' key |
-| FAIL | stack arrays are non-empty (blazesym resolved frames) | 0/71 resolved |
+| PASS | stack arrays are non-empty (blazesym resolved frames) | 71/71 resolved (0 lookup_failed, 0 symbolize_failed) |
 
 ### Phase 1 — network
 

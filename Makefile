@@ -16,7 +16,16 @@
 #   * cargo / rustc      — build blazesym wrapper (optional; falls back
 #                           to lib+offset resolution if absent)
 
-CLANG   ?= clang
+# Prefer the newest clang installed. clang 10 (Ubuntu 20.04's default,
+# still common in WSL distros) miscompiles BPF this project relies on:
+# it dropped stores into ringbuf records and constant-folded const
+# volatile config structs. The code now avoids both patterns, but a
+# modern clang is strongly recommended.
+CLANG   ?= $(shell for c in clang-19 clang-18 clang-17 clang-16 clang-15 clang-14 clang-13 clang-12 clang; do command -v $$c >/dev/null 2>&1 && { echo $$c; break; }; done)
+CLANG_MAJOR := $(shell $(CLANG) -dumpversion 2>/dev/null | cut -d. -f1)
+ifeq ($(shell test "$(CLANG_MAJOR)" -lt 12 2>/dev/null && echo old),old)
+$(warning $(CLANG) is version $(CLANG_MAJOR); >= 12 recommended for BPF. On Ubuntu: sudo apt-get install clang-14, then make clean all)
+endif
 LLC     ?= llc
 CC      ?= gcc
 CARGO   ?= cargo
@@ -69,7 +78,7 @@ dirs:
 
 # ---------- BPF programs ----------
 
-$(OBJ_DIR)/%.bpf.o: $(BPF_DIR)/%.bpf.c $(INC_DIR)/common.h $(INC_DIR)/maps.h
+$(OBJ_DIR)/%.bpf.o: $(BPF_DIR)/%.bpf.c $(INC_DIR)/common.h $(INC_DIR)/maps.h $(INC_DIR)/pidns.h
 	$(CLANG) $(CLANG_FLAGS) -c $< -o $@
 
 # ---------- blazesym wrapper (Rust) ----------

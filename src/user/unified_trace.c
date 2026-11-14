@@ -8,6 +8,8 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "common.h"
@@ -41,6 +43,7 @@ static int stacks_ok = 0;              /* blazesym returned >= 1 frame */
 static int stacks_lookup_failed = 0;   /* stack_id not found in stack map */
 static int stacks_symbolize_failed = 0;/* addrs found, blazesym returned 0 frames */
 static int stacks_raw = 0;             /* symbolization disabled; raw addrs */
+static int stacks_outside_ns = 0;      /* task not visible in our pid namespace */
 static int stack_lookup_errno = 0;     /* first lookup errno, for diagnosis */
 
 /* Collected events */
@@ -60,6 +63,24 @@ static void sig_handler(int sig)
     exiting = true;
 }
 
+/* Print the NSpid line of /proc/<pid>/status (pid as seen from each
+ * namespace level, outermost visible first). Diagnostics only. */
+static void print_nspid(const char *label, const char *pidstr)
+{
+    char path[64], line[256];
+    snprintf(path, sizeof(path), "/proc/%s/status", pidstr);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "DEBUG %s: %s not found\n", label, path);
+        return;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "NSpid:", 6) || !strncmp(line, "Name:", 5))
+            fprintf(stderr, "DEBUG %s: %s", label, line);
+    }
+    fclose(f);
+}
+
 static int libbpf_print_fn(enum libbpf_print_level level,
                            const char *fmt, va_list args)
 {
@@ -68,41 +89,29 @@ static int libbpf_print_fn(enum libbpf_print_level level,
     return vfprintf(stderr, fmt, args);
 }
 
-/* Find an object's .rodata map. Newer libbpf names it "<obj>.rodata"
- * (e.g. "trace_cp.rodata"), so a literal ".rodata" lookup fails
- * silently and the knobs never get set. */
-static struct bpf_map *find_rodata(struct bpf_object *obj)
+/* Write a program's config struct into its one-entry config map. Called
+ * after bpf_object__load() and BEFORE attaching, so no event ever sees an
+ * unconfigured program. (Config used to live in const volatile .rodata;
+ * clang 10 constant-folds that, ignoring every knob.) Returns 0 on success. */
+static int write_cfg_map(struct bpf_object *obj, const char *map_name,
+                         const void *cfg, size_t cfg_sz, const char *what)
 {
-    struct bpf_map *m = bpf_object__find_map_by_name(obj, ".rodata");
-    if (m)
-        return m;
-    bpf_object__for_each_map(m, obj) {
-        const char *name = bpf_map__name(m);
-        if (name && strstr(name, ".rodata"))
-            return m;
-    }
-    return NULL;
-}
-
-/* Copy `cfg` into an object's .rodata before load. Returns 0 on success. */
-static int set_rodata(struct bpf_object *obj, const char *what,
-                      const void *cfg, size_t cfg_sz)
-{
-    struct bpf_map *rodata = find_rodata(obj);
-    if (!rodata) {
-        fprintf(stderr, "WARNING: %s .rodata map not found; using defaults\n", what);
+    struct bpf_map *m = bpf_object__find_map_by_name(obj, map_name);
+    if (!m) {
+        fprintf(stderr, "ERROR: %s config map '%s' not found\n", what, map_name);
         return -1;
     }
-    size_t actual = bpf_map__value_size(rodata);
-    if (actual != cfg_sz) {
-        fprintf(stderr, "WARNING: %s .rodata size mismatch (kernel=%zu, user=%zu); "
-                "knobs ignored\n", what, actual, cfg_sz);
+    if (bpf_map__value_size(m) != cfg_sz) {
+        fprintf(stderr, "ERROR: %s config size mismatch (bpf=%u, user=%zu); "
+                "struct definitions out of sync\n", what, bpf_map__value_size(m), cfg_sz);
         return -1;
     }
-    int rc = bpf_map__set_initial_value(rodata, cfg, cfg_sz);
-    if (rc)
-        fprintf(stderr, "WARNING: failed to set %s .rodata: %d\n", what, rc);
-    return rc;
+    __u32 k0 = 0;
+    if (bpf_map_update_elem(bpf_map__fd(m), &k0, cfg, BPF_ANY) != 0) {
+        fprintf(stderr, "ERROR: writing %s config failed: %s\n", what, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 /* Kernel map id behind an fd, or 0 on error. Used to prove the CPU and
@@ -313,6 +322,14 @@ static void emit_stack_json(FILE *f, int stack_id, int pid)
     }
     if (n > max_stack_frames_in_json)
         n = max_stack_frames_in_json;
+
+    /* Task lives outside the tracer's pid namespace: there is no
+     * /proc/<pid> to symbolize against from here. */
+    if ((unsigned)pid >= PID_OUTSIDE_NS_BASE) {
+        stacks_outside_ns++;
+        emit_raw_frames(f, addrs, n, "outside_pidns", (int)((unsigned)pid - PID_OUTSIDE_NS_BASE));
+        return;
+    }
 
     if (!symbolize_enabled || symbolizer == NULL) {
         /* Fallback: raw addresses. Still useful for grep/manual addr2line. */
@@ -638,8 +655,10 @@ static void output_chrome_tracing_json(const char *filename)
     fprintf(f, "  \"metadata\": {\n");
     fprintf(f, "    \"event_count\": %d,\n", event_count);
     fprintf(f, "    \"stacks\": {\"ok\": %d, \"lookup_failed\": %d, "
-            "\"symbolize_failed\": %d, \"raw\": %d},\n",
-            stacks_ok, stacks_lookup_failed, stacks_symbolize_failed, stacks_raw);
+            "\"symbolize_failed\": %d, \"outside_pidns\": %d, \"raw\": %d},\n",
+            stacks_ok, stacks_lookup_failed, stacks_symbolize_failed,
+            stacks_outside_ns, stacks_raw);
+    fprintf(f, "    \"outside_pidns_base\": %u,\n", PID_OUTSIDE_NS_BASE);
     fprintf(f, "    \"tool\": \"ebpf-unified-trace\"\n");
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
@@ -744,6 +763,45 @@ int main(int argc, char **argv)
     /* libbpf logging: warnings always, debug/verifier output with --verbose. */
     libbpf_set_print(libbpf_print_fn);
 
+    /* Target pid namespace for id translation (see include/pidns.h).
+     * BPF reports root-namespace ids; inside WSL2 or a container those
+     * don't exist in the /proc we symbolize through. What matters is the
+     * namespace that OWNS that /proc -- the one /proc/1 lives in -- not
+     * necessarily our own: on WSL2 the tracer (launched via sudo from a
+     * wsl.exe session) was observed in a different pid namespace from the
+     * agent and from /proc, so translating into /proc/self/ns/pid still
+     * produced ids that /proc didn't know. Use /proc/1's namespace, fall
+     * back to our own. */
+    __u32 pidns_inum = 0;
+    __u64 pidns_dev = 0;
+    {
+        struct stat st_proc, st_self;
+        int have_proc = stat("/proc/1/ns/pid", &st_proc) == 0;
+        int have_self = stat("/proc/self/ns/pid", &st_self) == 0;
+        /* bpf_get_ns_current_pid_tgid() compares against the kernel's
+         * internal dev_t (MKDEV: major << 20 | minor), not glibc's st_dev
+         * encoding. They only agree for minor < 256; nsfs minors on WSL2
+         * are larger, so the raw st_dev made the helper fail silently. */
+        if (have_proc) {
+            pidns_inum = (__u32)st_proc.st_ino;
+            pidns_dev = ((__u64)major(st_proc.st_dev) << 20) | minor(st_proc.st_dev);
+        } else if (have_self) {
+            pidns_inum = (__u32)st_self.st_ino;
+            pidns_dev = ((__u64)major(st_self.st_dev) << 20) | minor(st_self.st_dev);
+        }
+        if (pidns_inum) {
+            printf("PID namespace: inode %u, nsfs dev %llu:%llu (ids reported as /proc sees them)\n",
+                   pidns_inum, (unsigned long long)(pidns_dev >> 20),
+                   (unsigned long long)(pidns_dev & 0xfffff));
+            if (have_proc && have_self && st_proc.st_ino != st_self.st_ino)
+                printf("ℹ tracer runs in a different pid namespace (inode %u) than /proc (inode %u); "
+                       "translating to /proc's\n", (__u32)st_self.st_ino, (__u32)st_proc.st_ino);
+        } else {
+            fprintf(stderr, "WARNING: cannot stat /proc/1/ns/pid or /proc/self/ns/pid (%s); "
+                    "reporting root-namespace ids\n", strerror(errno));
+        }
+    }
+
     /* Remove a stale pin left by pre-reuse_fd builds (needs root; harmless
      * if absent). Nothing pins stack_traces any more. */
     if (unlink(STACK_TRACES_LEGACY_PIN_PATH) == 0)
@@ -762,13 +820,16 @@ int main(int argc, char **argv)
             __u32 target_tgid;
             __u8  offcpu_stacks;
             __u8  _pad[3];
+            __u32 pidns_inum;
+            __u32 _pad2;
         } sched_cfg = {
             .target_tgid   = (__u32)target_pid,
             .offcpu_stacks = (__u8)(offcpu_stacks_cli && capture_stacks_cli),
+            .pidns_inum    = pidns_inum,
         };
-        set_rodata(cpu_obj, "CPU", &sched_cfg, sizeof(sched_cfg));
-
         err = bpf_object__load(cpu_obj);
+        if (!err && write_cfg_map(cpu_obj, "sched_cfg", &sched_cfg, sizeof(sched_cfg), "CPU") != 0)
+            err = -EINVAL;
         if (err) {
             fprintf(stderr, "WARNING: failed to load CPU BPF object: %d (%s); "
                     "CPU tracing disabled. Re-run with --verbose for the libbpf/verifier log.\n"
@@ -837,16 +898,21 @@ int main(int argc, char **argv)
         __u32 sample_period_sync;
         __u32 sample_period_async;
         __u8  capture_stacks;
-        __u8  _pad[3];
+        __u8  debug_pidns;
+        __u8  _pad[2];
+        __u32 pidns_inum;
+        __u32 _pad2;
+        __u64 pidns_dev;
     };
     struct cuda_tracer_cfg gpu_cfg = {
         .target_pid          = (__u32)target_pid,
         .sample_period_sync  = (__u32)sample_period_sync,
         .sample_period_async = (__u32)sample_period_async,
         .capture_stacks      = (__u8)capture_stacks_cli,
+        .pidns_inum          = pidns_inum,
+        .pidns_dev           = pidns_dev,
+        .debug_pidns         = (__u8)verbose,
     };
-    set_rodata(gpu_obj, "GPU", &gpu_cfg, sizeof(gpu_cfg));
-
     /* Share ONE stack map between the CPU and GPU objects. Without this
      * each object gets its own map, GPU stack ids get looked up in the
      * CPU map, and every GPU stack comes back empty. */
@@ -865,6 +931,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "ERROR: failed to load GPU BPF object: %d (%s)\n", err, strerror(-err));
         goto cleanup;
     }
+    if (write_cfg_map(gpu_obj, "cuda_cfg", &gpu_cfg, sizeof(gpu_cfg), "GPU") != 0)
+        goto cleanup;
 
     {
         int gpu_stack_fd = bpf_object__find_map_fd_by_name(gpu_obj, "stack_traces");
@@ -1037,13 +1105,49 @@ int main(int argc, char **argv)
         }
     }
     
+    if (verbose && gpu_obj) {
+        struct { __u32 level; __s32 helper_rc; __u32 helper_pid, helper_tgid;
+                 __u32 nr[4], inum[4], tgid_nr[4]; } d = {0};
+        int dfd = bpf_object__find_map_fd_by_name(gpu_obj, "pidns_debug");
+        __u32 k0 = 0;
+        if (dfd >= 0 && bpf_map_lookup_elem(dfd, &k0, &d) == 0) {
+            fprintf(stderr, "DEBUG pidns chain: level=%u helper_rc=%d helper=(tgid %u, tid %u)\n",
+                    d.level, d.helper_rc, d.helper_tgid, d.helper_pid);
+            for (int i = 0; i < 4; i++)
+                fprintf(stderr, "DEBUG   numbers[%d]: tid nr=%u tgid nr=%u ns.inum=%u\n",
+                        i, d.nr[i], d.tgid_nr[i], d.inum[i]);
+        }
+    }
+
+    /* pid-namespace sanity check (a few lines, always printed): do the
+     * pids we recorded exist in the /proc we will symbolize through? */
+    {
+        fprintf(stderr, "DEBUG tracer getpid()=%d\n", getpid());
+        print_nspid("tracer", "self");
+        /* Up to 4 distinct GPU-event pids: do they exist in our /proc? */
+        __u32 seen[4] = {0};
+        int nseen = 0;
+        for (int i = 0; i < event_count && nseen < 4; i++) {
+            if (events[i].type != 1) continue;
+            __u32 p = events[i].gpu.pid;
+            int dup = 0;
+            for (int k = 0; k < nseen; k++) dup |= seen[k] == p;
+            if (dup) continue;
+            seen[nseen++] = p;
+            char ps[16], lbl[48];
+            snprintf(ps, sizeof(ps), "%u", p);
+            snprintf(lbl, sizeof(lbl), "gpu pid %u (comm %s)", p, events[i].gpu.comm);
+            print_nspid(lbl, ps);
+        }
+    }
+
     /* Sort events by timestamp */
     qsort(events, event_count, sizeof(struct unified_event), compare_events);
     
     /* Output Chrome Tracing JSON */
     output_chrome_tracing_json(output_file);
-    printf("  Stacks: %d resolved, %d lookup_failed, %d symbolize_failed, %d raw\n",
-           stacks_ok, stacks_lookup_failed, stacks_symbolize_failed, stacks_raw);
+    printf("  Stacks: %d resolved, %d lookup_failed, %d symbolize_failed, %d outside_pidns, %d raw\n",
+           stacks_ok, stacks_lookup_failed, stacks_symbolize_failed, stacks_outside_ns, stacks_raw);
     if (stacks_lookup_failed)
         fprintf(stderr, "  NOTE: stack lookups failed (first errno %d: %s) -- stack map problem, "
                 "not symbolization.\n", stack_lookup_errno, strerror(stack_lookup_errno));
