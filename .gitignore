@@ -28,3 +28,7 @@ tests/unit/test_chrome_json
 # OS files
 .DS_Store
 Thumbs.db
+
+# wsl-dev MCP server job logs and copied artifacts
+runs/wsl-jobs/
+runs/wsl/
