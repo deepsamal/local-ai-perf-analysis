@@ -69,7 +69,7 @@ Settings → Developer → Edit Config) and add to `mcpServers` alongside
 ```
 
 - Use the full path to `python.exe` if `python` isn't on your PATH
-  (e.g. your conda base `python.exe`). Python 3.9+; no packages needed.
+  (e.g. your conda base `python.exe`). Python 3.8+ (tested on 3.8 and 3.12); no packages needed.
 - Optional env: `WSL_DEV_DISTRO` (default: WSL default distro),
   `WSL_DEV_WSL_REPO` (default `$HOME/code/local-ai-perf-analysis`, no spaces).
 - Set `WSL_DEV_ALLOW_EXEC` to `"1"` to enable `wsl_exec`; restart the app
