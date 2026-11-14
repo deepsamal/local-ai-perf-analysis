@@ -157,7 +157,7 @@ fn kernel_thread_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send +
         let p = P { p: Parser::create(rec, &schema), sh: &sh, tag: &tag };
         let ts = rec.raw_timestamp();
         let r = match op {
-            1 | 3 | 2 | 4 => match (p.u32("ProcessId"), p.u32("TThreadId")) {
+            1..=4 => match (p.u32("ProcessId"), p.u32("TThreadId")) {
                 (Some(pid), Some(tid)) => Raw::Thread { ts, pid, tid, start: op == 1 || op == 3 },
                 _ => return,
             },
@@ -180,7 +180,7 @@ fn kernel_thread_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send +
 fn kernel_process_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 'static {
     move |rec, loc| {
         let op = rec.opcode();
-        if !matches!(op, 1 | 2 | 3) {
+        if !matches!(op, 1..=3) {
             return;
         }
         let Some((schema, tag)) = parser!(&sh, rec, loc, format!("Process/op{op}")) else { return };
