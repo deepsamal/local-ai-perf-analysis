@@ -32,3 +32,5 @@ Thumbs.db
 # wsl-dev MCP server job logs and copied artifacts
 runs/wsl-jobs/
 runs/wsl/
+windows/etw-collector/target/
+runs/etw/

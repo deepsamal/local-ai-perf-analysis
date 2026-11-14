@@ -45,7 +45,7 @@ import uuid
 from pathlib import Path, PureWindowsPath
 
 SERVER_NAME = "wsl-dev"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 
 HERE = Path(__file__).resolve().parent
@@ -56,6 +56,9 @@ WSL_EXE = os.environ.get("WSL_DEV_WSL_EXE", "wsl.exe")
 WSL_REPO = os.environ.get("WSL_DEV_WSL_REPO") or f"$HOME/code/{WIN_REPO.name}"
 JOB_DIR = WIN_REPO / "runs" / "wsl-jobs"
 WRAPPER = "/usr/local/sbin/lapa-root"
+ETW_DIR = WIN_REPO / "windows" / "etw-collector"
+ETW_RUNS = WIN_REPO / "runs" / "etw"
+CARGO_CMDS = ["version", "check", "build", "test", "clippy"]
 
 MAKE_TARGETS = ["all", "mock", "clean", "test", "test-gpu", "test-python",
                 "test-synthetic", "bench"]
@@ -123,7 +126,8 @@ def run_sync(script: str, timeout: int = 45) -> tuple[int, str]:
 # --------------------------------------------------------------------------
 
 class Job:
-    def __init__(self, kind: str, script: str):
+    def __init__(self, kind: str, script: str, argv: list | None = None,
+                 cwd: Path | None = None):
         self.id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         self.kind = kind
         self.started = time.time()
@@ -135,11 +139,21 @@ class Job:
         self._log.write(f"### job {self.id} kind={kind}\n".encode())
         self._log.flush()
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self.proc = subprocess.Popen(wsl_argv(), stdin=subprocess.PIPE,
-                                     stdout=self._log, stderr=subprocess.STDOUT,
-                                     creationflags=flags)
-        self.proc.stdin.write((prelude() + script).encode())
-        self.proc.stdin.close()
+        if argv is None:
+            self.proc = subprocess.Popen(wsl_argv(), stdin=subprocess.PIPE,
+                                         stdout=self._log, stderr=subprocess.STDOUT,
+                                         creationflags=flags)
+            self.proc.stdin.write((prelude() + script).encode())
+            self.proc.stdin.close()
+        else:
+            # Native Windows command (no shell): argv is built from validated
+            # parts only.
+            self._log.write(("$ " + " ".join(argv) + "\n").encode())
+            self._log.flush()
+            self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                         stdout=self._log, stderr=subprocess.STDOUT,
+                                         cwd=str(cwd) if cwd else None,
+                                         creationflags=flags)
         threading.Thread(target=self._wait, daemon=True).start()
 
     def _wait(self):
@@ -176,8 +190,9 @@ class Job:
 JOBS: dict[str, Job] = {}
 
 
-def start_and_wait(kind: str, script: str, wait_s: int) -> str:
-    job = Job(kind, script)
+def start_and_wait(kind: str, script: str, wait_s: int,
+                   argv: list | None = None, cwd: Path | None = None) -> str:
+    job = Job(kind, script, argv, cwd)
     JOBS[job.id] = job
     deadline = time.time() + max(0, min(wait_s, MAX_WAIT_S))
     while job.running and time.time() < deadline:
@@ -358,6 +373,81 @@ def tool_exec(args: dict) -> str:
     return start_and_wait("exec", script, int(args.get("wait_s", 30)))
 
 
+# ---- native Windows: etw-collector ---------------------------------------
+
+def _cargo_exe() -> str:
+    import shutil
+    c = shutil.which("cargo")
+    if c:
+        return c
+    home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    c = home / "bin" / "cargo.exe"
+    if c.exists():
+        return str(c)
+    raise RuntimeError("cargo not found on Windows PATH or in %USERPROFILE%\\.cargo\\bin; "
+                       "install Rust from https://rustup.rs (MSVC toolchain)")
+
+
+def tool_win_cargo(args: dict) -> str:
+    cmd = args.get("command", "")
+    if cmd not in CARGO_CMDS:
+        raise ValueError(f"command must be one of {CARGO_CMDS}")
+    cargo = _cargo_exe()
+    if cmd == "version":
+        return start_and_wait("cargo version", "", int(args.get("wait_s", 20)),
+                              argv=[cargo, "--version", "--verbose"], cwd=ETW_DIR)
+    argv = [cargo, cmd]
+    if args.get("release"):
+        argv.append("--release")
+    if cmd == "clippy":
+        argv += ["--all-targets"]
+    argv += ["--color", "never"]
+    return start_and_wait(f"cargo {cmd}", "", int(args.get("wait_s", 45)), argv=argv, cwd=ETW_DIR)
+
+
+def tool_win_collect(args: dict) -> str:
+    exe = ETW_DIR / "target" / "release" / "etw-collector.exe"
+    if not exe.exists():
+        raise RuntimeError(f"{exe} not built; run win_cargo(command='build', release=true)")
+    argv = [str(exe)]
+    pids = args.get("pid") or []
+    names = args.get("process_name") or []
+    if isinstance(pids, int):
+        pids = [pids]
+    if isinstance(names, str):
+        names = [names]
+    for p in pids:
+        p = int(p)
+        if not 1 <= p <= 0xFFFFFFFF:
+            raise ValueError("bad pid")
+        argv += ["--pid", str(p)]
+    for n in names:
+        if not NAME_RE.match(str(n)):
+            raise ValueError("process_name: letters, digits, '._-' only")
+        argv += ["--process-name", str(n)]
+    if not pids and not names:
+        raise ValueError("pid or process_name required")
+    d = int(args.get("duration", 10))
+    if not 1 <= d <= 300:
+        raise ValueError("duration must be in [1, 300]")
+    argv += ["--duration", str(d)]
+    for key, flag in (("follow_children", "--follow-children"), ("no_cpu", "--no-cpu"),
+                      ("no_faults", "--no-faults"), ("no_gpu", "--no-gpu"),
+                      ("no_net", "--no-net"), ("verbose", "--verbose")):
+        if args.get(key):
+            argv.append(flag)
+    name = args.get("output_name") or f"etw-{time.strftime('%Y%m%d-%H%M%S')}"
+    if not NAME_RE.match(name):
+        raise ValueError("output_name: letters, digits, '._-' only")
+    ETW_RUNS.mkdir(parents=True, exist_ok=True)
+    argv += ["--output", str(ETW_RUNS / f"{name}.json")]
+    if args.get("save_raw", True):
+        argv += ["--save-raw", str(ETW_RUNS / f"{name}.raw.jsonl")]
+    wait = int(args.get("wait_s", min(d + 10, MAX_WAIT_S)))
+    return start_and_wait("etw collect", "", wait, argv=argv, cwd=WIN_REPO) + \
+        "\n\n(runs with this server's privileges: not elevated unless the Claude app is)"
+
+
 def _schema(props: dict, required: list[str] | None = None) -> dict:
     return {"type": "object", "properties": props, "required": required or [],
             "additionalProperties": False}
@@ -390,6 +480,18 @@ TOOLS = {
                  _schema({"path": {"type": "string"}, "tail_bytes": {"type": "integer", "minimum": 1, "maximum": 200000}}, ["path"])),
     "wsl_copy_to_windows": (tool_copy, "Copy a file from WSL (WSL repo or /tmp only) into <Windows repo>/runs/wsl/ so it can be opened from Windows.",
                             _schema({"path": {"type": "string"}, "dest_name": {"type": "string"}}, ["path"])),
+    "win_cargo": (tool_win_cargo, "Run cargo (version/check/build/test/clippy) natively on Windows in windows/etw-collector, as the normal user. Background job.",
+                  _schema({"command": {"type": "string", "enum": CARGO_CMDS},
+                           "release": {"type": "boolean", "default": False}, "wait_s": WAIT}, ["command"])),
+    "win_collect": (tool_win_collect, "Run the built etw-collector.exe (not elevated) for a target pid/process name. Writes runs/etw/<output_name>.json (+ .raw.jsonl).",
+                    _schema({"pid": {"type": "array", "items": {"type": "integer"}},
+                             "process_name": {"type": "array", "items": {"type": "string"}},
+                             "duration": {"type": "integer", "minimum": 1, "maximum": 300},
+                             "follow_children": {"type": "boolean"}, "no_cpu": {"type": "boolean"},
+                             "no_faults": {"type": "boolean"}, "no_gpu": {"type": "boolean"},
+                             "no_net": {"type": "boolean"}, "verbose": {"type": "boolean"},
+                             "save_raw": {"type": "boolean", "default": True},
+                             "output_name": {"type": "string"}, "wait_s": WAIT})),
 }
 if ALLOW_EXEC:
     TOOLS["wsl_exec"] = (tool_exec, "Run an arbitrary bash command in WSL as your normal user (NOT root), cwd = WSL repo. Enabled via WSL_DEV_ALLOW_EXEC=1.",
