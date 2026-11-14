@@ -25,6 +25,9 @@ pub struct Target {
     /// Case-insensitive image name match, e.g. "ollama.exe" or "ollama".
     pub names: Vec<String>,
     pub follow_children: bool,
+    /// Never trace this pid (the collector itself, which is a descendant of
+    /// the target when launched from it).
+    pub exclude_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +133,10 @@ struct GpuCtx {
 
 pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
     raw.sort_by_key(|r| r.ts());
-    let targets = resolve_targets(&raw, target);
+    let mut targets = resolve_targets(&raw, target);
+    if let Some(me) = target.exclude_pid {
+        targets.remove(&me);
+    }
     let t0 = raw.iter().map(|r| r.ts()).filter(|&t| t > 0).min().unwrap_or(0);
 
     let mut a = Analysis { t0, ..Default::default() };
@@ -395,7 +401,7 @@ mod tests {
     }
 
     fn tgt(follow: bool) -> Target {
-        Target { pids: vec![], names: vec!["ollama".into()], follow_children: follow }
+        Target { pids: vec![], names: vec!["ollama".into()], follow_children: follow, exclude_pid: None }
     }
 
     #[test]

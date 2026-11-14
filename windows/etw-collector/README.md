@@ -12,9 +12,9 @@ output in Perfetto or `chrome://tracing`.
 |---|---|---|---|
 | On-CPU, blocked (with wait reason), runnable | Kernel Thread class: CSwitch (36), ReadyThread (50), thread rundown | kernel | Administrator |
 | Hard page faults (model weights paged in from disk) | Kernel PageFault class, HardFault (32) | kernel | Administrator |
-| Process tree | Kernel Process class + `Microsoft-Windows-Kernel-Process` + Toolhelp snapshot | both | — |
+| Process tree | Toolhelp snapshot at start; kernel Process class + `Microsoft-Windows-Kernel-Process` for later starts | both | snapshot: none; live starts: Administrator |
 | GPU execution per context | `Microsoft-Windows-DxgKrnl`: QueuePacket 178/180, DmaPacket 175/177 | user | Admin or *Performance Log Users* |
-| TCP send/recv (e.g. agent ↔ `ollama serve` on :11434) | `Microsoft-Windows-Kernel-Network` 10/11/26/27 | user | Admin or *Performance Log Users* |
+| TCP send/recv (e.g. agent ↔ `ollama serve` on :11434) | `Microsoft-Windows-Kernel-Network` 10/11/26/27 | user | Administrator |
 
 On GPUs where DxgKrnl emits DMA packet events, the GPU spans show hardware
 execution, serialised per context the way PresentMon does it. With
@@ -26,8 +26,13 @@ skipped. This view covers DirectX, Vulkan and DirectML, plus CUDA on WDDM.
 CUDA kernels on a TCC-mode GPU never pass through DxgKrnl, so they do not
 appear here.
 
-If the kernel session can't start (the prompt isn't elevated), the collector
-says so and keeps going with the user providers.
+Only DxgKrnl can be enabled by a member of *Performance Log Users*: on
+Windows 11, `Kernel-Process` and `Kernel-Network` return access denied
+without elevation. The collector reports the token's groups, tries each
+provider on its own, and records with whatever it is allowed to enable.
+A non-elevated run therefore gives GPU spans only. Processes that start
+mid-capture are then picked up only if they submit GPU work and were in
+the start-up snapshot.
 
 ## Usage
 

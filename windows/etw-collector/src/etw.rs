@@ -235,7 +235,10 @@ fn dxg_cb(sh: Sh, verbose: bool) -> impl FnMut(&EventRecord, &SchemaLocator) + S
         let ts = rec.raw_timestamp();
         let r = match id {
             DXG_QUEUE_START | DXG_QUEUE_START_2 | DXG_QUEUE_START_3 => {
-                match (p.ptr("hContext"), p.u32("SubmitSequence"), p.u32("PacketType")) {
+                // QueuePacket_Start_2/_3 (244/245) carry no PacketType; they
+                // are command-buffer submissions, i.e. render packets.
+                let packet_type = if id == DXG_QUEUE_START { p.u32("PacketType") } else { Some(0) };
+                match (p.ptr("hContext"), p.u32("SubmitSequence"), packet_type) {
                     (Some(ctx), Some(seq), Some(packet_type)) => {
                         Raw::GpuQueueStart { ts, pid: rec.process_id(), ctx, seq, packet_type }
                     }
@@ -297,20 +300,32 @@ fn proc_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + Sync + '
     }
 }
 
-fn start_user(sh: &Sh, o: &Options) -> Result<UserTrace> {
-    let mut b = UserTrace::new().named("lapa-etw-user".to_string());
-    // Kernel-Process: WINEVENT_KEYWORD_PROCESS (0x10). Catches children
-    // that start mid-capture even without the kernel session.
-    b = b.enable(
-        Provider::by_guid(GUID::from(KERNEL_PROCESS))
-            .any(0x10)
-            .add_filter(EventFilter::ByEventIds(vec![1, 2]))
-            .add_callback(proc_cb(sh.clone()))
-            .build(),
-    );
-    if o.gpu {
-        b = b.enable(
-            Provider::by_guid(GUID::from(DXGKRNL))
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UserProv {
+    Process,
+    Gpu,
+    Net,
+}
+
+impl UserProv {
+    fn label(self) -> &'static str {
+        match self {
+            UserProv::Process => "Microsoft-Windows-Kernel-Process",
+            UserProv::Gpu => "Microsoft-Windows-DxgKrnl",
+            UserProv::Net => "Microsoft-Windows-Kernel-Network",
+        }
+    }
+
+    fn build(self, sh: &Sh, o: &Options) -> Provider {
+        match self {
+            // WINEVENT_KEYWORD_PROCESS (0x10). Catches children that start
+            // mid-capture even without the kernel session.
+            UserProv::Process => Provider::by_guid(GUID::from(KERNEL_PROCESS))
+                .any(0x10)
+                .add_filter(EventFilter::ByEventIds(vec![1, 2]))
+                .add_callback(proc_cb(sh.clone()))
+                .build(),
+            UserProv::Gpu => Provider::by_guid(GUID::from(DXGKRNL))
                 .any(DXG_KW_BASE | DXG_KW_PERFORMANCE)
                 .level(5)
                 .add_filter(EventFilter::ByEventIds(vec![
@@ -318,19 +333,82 @@ fn start_user(sh: &Sh, o: &Options) -> Result<UserTrace> {
                 ]))
                 .add_callback(dxg_cb(sh.clone(), o.verbose))
                 .build(),
-        );
-    }
-    if o.net {
-        // KERNEL_NETWORK_KEYWORD_IPV4 | _IPV6
-        b = b.enable(
-            Provider::by_guid(GUID::from(KERNEL_NETWORK))
+            // KERNEL_NETWORK_KEYWORD_IPV4 | _IPV6
+            UserProv::Net => Provider::by_guid(GUID::from(KERNEL_NETWORK))
                 .any(0x10 | 0x20)
                 .add_filter(EventFilter::ByEventIds(vec![10, 11, 26, 27]))
                 .add_callback(net_cb(sh.clone()))
                 .build(),
-        );
+        }
     }
-    b.start_and_process().map_err(|e| anyhow!("{e:?}"))
+}
+
+const USER_SESSION: &str = "lapa-etw-user";
+
+fn try_user(sh: &Sh, o: &Options, provs: &[UserProv]) -> Result<UserTrace> {
+    let mut b = UserTrace::new().named(USER_SESSION.to_string());
+    for p in provs {
+        b = b.enable(p.build(sh, o));
+    }
+    b.start_and_process().map_err(|e| {
+        // ferrisetw leaves the session running if StartTrace succeeded but
+        // EnableTraceEx2 failed; stop it so the next attempt can reuse the name.
+        let _ = ferrisetw::trace::stop_trace_by_name(USER_SESSION);
+        anyhow!("{e:?}")
+    })
+}
+
+/// Start the user session with every requested provider; if that fails,
+/// probe each provider alone and keep the ones the caller may enable.
+fn start_user(sh: &Sh, o: &Options, notes: &mut Vec<String>) -> Result<UserTrace> {
+    let _ = ferrisetw::trace::stop_trace_by_name(USER_SESSION); // stale session from a crashed run
+    let mut want = vec![UserProv::Process];
+    if o.gpu {
+        want.push(UserProv::Gpu);
+    }
+    if o.net {
+        want.push(UserProv::Net);
+    }
+    let first = match try_user(sh, o, &want) {
+        Ok(t) => return Ok(t),
+        Err(e) => e,
+    };
+    notes.push(format!("user session with all providers failed: {first}; probing individually"));
+    let mut ok = Vec::new();
+    for p in &want {
+        match try_user(sh, o, &[*p]) {
+            Ok(t) => {
+                let _ = t.stop();
+                notes.push(format!("  {}: ok", p.label()));
+                ok.push(*p);
+            }
+            Err(e) => notes.push(format!("  {}: {e}", p.label())),
+        }
+    }
+    if ok.is_empty() {
+        return Err(first);
+    }
+    try_user(sh, o, &ok)
+}
+
+/// (elevated administrator, member of Performance Log Users) for this token.
+pub fn token_groups() -> (bool, bool) {
+    use windows_sys::Win32::Security::{
+        CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid, WinBuiltinPerfLoggingUsersSid,
+        SECURITY_MAX_SID_SIZE, WELL_KNOWN_SID_TYPE,
+    };
+    fn member(kind: WELL_KNOWN_SID_TYPE) -> bool {
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut len = SECURITY_MAX_SID_SIZE;
+        unsafe {
+            if CreateWellKnownSid(kind, std::ptr::null_mut(), sid.as_mut_ptr() as _, &mut len) == 0 {
+                return false;
+            }
+            let mut is = 0;
+            CheckTokenMembership(std::ptr::null_mut(), sid.as_mut_ptr() as _, &mut is) != 0 && is != 0
+        }
+    }
+    (member(WinBuiltinAdministratorsSid), member(WinBuiltinPerfLoggingUsersSid))
 }
 
 // -------------------------------------------------------------- snapshot
@@ -392,6 +470,8 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
     // user early if nothing matched (processes may still start later).
     let initial = sh.lock().unwrap().filter.target_pids().len();
     let mut notes = vec![format!("toolhelp snapshot: {nsnap} records; {initial} target process(es) running at start")];
+    let (admin, perflog) = token_groups();
+    notes.push(format!("token: elevated administrator = {admin}, Performance Log Users = {perflog}"));
 
     let need_kernel = o.cpu || o.faults;
     let kernel = if need_kernel {
@@ -408,12 +488,13 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
     } else {
         None
     };
-    let user = match start_user(&sh, o) {
+    let user = match start_user(&sh, o, &mut notes) {
         Ok(t) => Some(t),
         Err(e) => {
             notes.push(format!(
                 "user session unavailable ({e}); GPU/TCP/process events disabled. \
-                 Requires Administrator or membership in 'Performance Log Users'."
+                 DxgKrnl needs Administrator or 'Performance Log Users'; Kernel-Process and \
+                 Kernel-Network need Administrator."
             ));
             None
         }

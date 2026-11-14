@@ -71,6 +71,9 @@ fn parse_args() -> Result<Args> {
             other => bail!("unknown argument '{other}'\n\n{USAGE}"),
         }
     }
+    if a.replay.is_none() {
+        a.target.exclude_pid = Some(std::process::id());
+    }
     if a.target.pids.is_empty() && a.target.names.is_empty() {
         bail!("specify at least one --pid or --process-name\n\n{USAGE}");
     }
@@ -177,7 +180,14 @@ fn main() -> Result<()> {
     w.flush()?;
 
     eprintln!("\n{} spans -> {}", analysis.spans.len(), a.output);
+    let mut idle = 0;
     for (pid, s) in &analysis.summary {
+        let active = s.on_cpu_ms > 0.0 || s.blocked_ms > 0.0 || s.gpu_packets > 0 || s.hard_faults > 0
+            || s.tcp_sent_bytes > 0 || s.tcp_recv_bytes > 0;
+        if !active && !a.verbose {
+            idle += 1;
+            continue;
+        }
         eprintln!(
             "  {pid:>6} {:<28} cpu {:>8.1} ms | blocked {:>8.1} ms | runnable {:>7.1} ms | gpu {:>8.1} ms ({} pkts, {}) | faults {} | tcp tx {} rx {}",
             s.name, s.on_cpu_ms, s.blocked_ms, s.runnable_ms, s.gpu_busy_ms, s.gpu_packets,
@@ -189,6 +199,9 @@ fn main() -> Result<()> {
             let t: Vec<String> = top.iter().take(4).map(|(k, v)| format!("{k} {v:.1}ms")).collect();
             eprintln!("         blocked on: {}", t.join(", "));
         }
+    }
+    if idle > 0 {
+        eprintln!("  (+{idle} target processes with no recorded activity; -v to list)");
     }
     Ok(())
 }

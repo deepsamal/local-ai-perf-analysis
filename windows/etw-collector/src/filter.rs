@@ -42,7 +42,7 @@ impl LiveFilter {
                 if *start {
                     let by_name = self.target.names.iter().any(|w| crate::spans::name_matches(name, w));
                     let by_parent = self.target.follow_children && self.pids.contains(ppid);
-                    if by_name || by_parent {
+                    if (by_name || by_parent) && Some(*pid) != self.target.exclude_pid {
                         self.pids.insert(*pid);
                     }
                 }
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn keeps_only_target_activity() {
-        let mut f = LiveFilter::new(Target { pids: vec![], names: vec!["ollama.exe".into()], follow_children: true });
+        let mut f = LiveFilter::new(Target { pids: vec![], names: vec!["ollama.exe".into()], follow_children: true, exclude_pid: None });
         let evs = [
             Raw::Proc { ts: 0, pid: 10, ppid: 1, name: "ollama.exe".into(), start: true },
             Raw::Proc { ts: 0, pid: 11, ppid: 10, name: "llama-server.exe".into(), start: true },
