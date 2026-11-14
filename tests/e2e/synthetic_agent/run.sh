@@ -69,6 +69,24 @@ fi
 pkill -f 'synthetic_agent/server.py' 2>/dev/null || true
 pkill -f 'synthetic_agent/agent.py' 2>/dev/null || true
 
+# Stop a process without ever blocking indefinitely: TERM, poll up to
+# ~3 s, then KILL. A bare `wait` on the sudo wrappers could hang forever
+# (sudo with use_pty doesn't always exit after its child is killed), which
+# left the harness stuck after "tracer done". Reaps with a background-safe
+# `wait` only once the pid is gone.
+stop_pid() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in {1..30}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 # Always-on cleanup so Ctrl+C, errors, etc. don't leak processes.
 # Set this BEFORE we start spawning subprocesses; the trap captures
 # variables by name so we'll have current values at exit time.
@@ -174,18 +192,11 @@ wait "$TRACER_PID" 2>/dev/null || true
 
 # ----- 6. cleanup
 echo "=== tracer done; killing agent + server ==="
-if [[ -n "$REAL_AGENT_PID" ]] && kill -0 "$REAL_AGENT_PID" 2>/dev/null; then
-    kill -TERM "$REAL_AGENT_PID" 2>/dev/null || true
-    for _ in {1..20}; do
-        kill -0 "$REAL_AGENT_PID" 2>/dev/null || break
-        sleep 0.1
-    done
-    kill -KILL "$REAL_AGENT_PID" 2>/dev/null || true
-fi
-kill -TERM "$AGENT_PID_WRAPPER" 2>/dev/null || true
-wait "$AGENT_PID_WRAPPER" 2>/dev/null || true
-kill -TERM "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
+stop_pid "$REAL_AGENT_PID"
+stop_pid "$AGENT_PID_WRAPPER"
+stop_pid "$SEARCH_PID"
+stop_pid "$SERVER_PID"
+echo "=== agent + server stopped ==="
 
 # Show the agent's progress for context
 echo
