@@ -7,9 +7,11 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "common.h"
+#include "maps.h"
 #include "blazesym_wrap.h"
 
 static volatile bool exiting = false;
@@ -26,6 +28,21 @@ static bsw_symbolizer_t *symbolizer = NULL;
 static int symbolize_enabled = 1;
 static int max_stack_frames_in_json = 12; /* truncate JSON stacks to keep file size bounded */
 
+/* libbpf log verbosity: warnings/info always shown, debug (verifier log
+ * etc.) only with --verbose. libbpf output used to be silenced entirely,
+ * which is why load failures showed up as a bare "-22".
+ */
+static int verbose = 0;
+
+/* Stack-emission outcome counters, printed at exit and written into the
+ * JSON metadata so "why are my stacks empty?" is answerable from the
+ * trace itself. */
+static int stacks_ok = 0;              /* blazesym returned >= 1 frame */
+static int stacks_lookup_failed = 0;   /* stack_id not found in stack map */
+static int stacks_symbolize_failed = 0;/* addrs found, blazesym returned 0 frames */
+static int stacks_raw = 0;             /* symbolization disabled; raw addrs */
+static int stack_lookup_errno = 0;     /* first lookup errno, for diagnosis */
+
 /* Collected events */
 #define MAX_EVENTS 100000
 static struct unified_event {
@@ -41,6 +58,62 @@ static int event_count = 0;
 static void sig_handler(int sig)
 {
     exiting = true;
+}
+
+static int libbpf_print_fn(enum libbpf_print_level level,
+                           const char *fmt, va_list args)
+{
+    if (level == LIBBPF_DEBUG && !verbose)
+        return 0;
+    return vfprintf(stderr, fmt, args);
+}
+
+/* Find an object's .rodata map. Newer libbpf names it "<obj>.rodata"
+ * (e.g. "trace_cp.rodata"), so a literal ".rodata" lookup fails
+ * silently and the knobs never get set. */
+static struct bpf_map *find_rodata(struct bpf_object *obj)
+{
+    struct bpf_map *m = bpf_object__find_map_by_name(obj, ".rodata");
+    if (m)
+        return m;
+    bpf_object__for_each_map(m, obj) {
+        const char *name = bpf_map__name(m);
+        if (name && strstr(name, ".rodata"))
+            return m;
+    }
+    return NULL;
+}
+
+/* Copy `cfg` into an object's .rodata before load. Returns 0 on success. */
+static int set_rodata(struct bpf_object *obj, const char *what,
+                      const void *cfg, size_t cfg_sz)
+{
+    struct bpf_map *rodata = find_rodata(obj);
+    if (!rodata) {
+        fprintf(stderr, "WARNING: %s .rodata map not found; using defaults\n", what);
+        return -1;
+    }
+    size_t actual = bpf_map__value_size(rodata);
+    if (actual != cfg_sz) {
+        fprintf(stderr, "WARNING: %s .rodata size mismatch (kernel=%zu, user=%zu); "
+                "knobs ignored\n", what, actual, cfg_sz);
+        return -1;
+    }
+    int rc = bpf_map__set_initial_value(rodata, cfg, cfg_sz);
+    if (rc)
+        fprintf(stderr, "WARNING: failed to set %s .rodata: %d\n", what, rc);
+    return rc;
+}
+
+/* Kernel map id behind an fd, or 0 on error. Used to prove the CPU and
+ * GPU objects really share one stack_traces map. */
+static __u32 map_id_of(int fd)
+{
+    struct bpf_map_info info = {};
+    __u32 len = sizeof(info);
+    if (fd < 0 || bpf_obj_get_info_by_fd(fd, &info, &len) != 0)
+        return 0;
+    return info.id;
 }
 
 static const char* cuda_op_name(int op_type)
@@ -150,17 +223,21 @@ static void json_escape(char *dst, size_t dst_len, const char *src)
 }
 
 /* Pull stack addresses from the BPF stack map for the given stack_id.
- * Returns the number of valid (non-zero) addresses written into out[].
+ * Returns the number of valid (non-zero) addresses written into out[],
+ * or -1 if the lookup itself failed (stack_id not in the map we hold).
  */
 static int read_stack_addrs(int stack_id, __u64 *out, int out_cap)
 {
     if (stack_id < 0 || stack_map_fd < 0)
-        return 0;
+        return -1;
 
     __u64 stack[PERF_MAX_STACK_DEPTH];
     memset(stack, 0, sizeof(stack));
-    if (bpf_map_lookup_elem(stack_map_fd, &stack_id, stack) != 0)
-        return 0;
+    if (bpf_map_lookup_elem(stack_map_fd, &stack_id, stack) != 0) {
+        if (!stack_lookup_errno)
+            stack_lookup_errno = errno;
+        return -1;
+    }
 
     int n = 0;
     for (int i = 0; i < PERF_MAX_STACK_DEPTH && n < out_cap; i++) {
@@ -179,10 +256,41 @@ static int read_stack_addrs(int stack_id, __u64 *out, int out_cap)
  * Format:
  *   [{"sym":"...", "file":"...", "line":123, "lib":"libfoo.so", "inlined":0}, ...]
  */
+/* Raw-address frames, optionally preceded by an error marker frame. */
+static void emit_raw_frames(FILE *f, const __u64 *addrs, int n,
+                            const char *err, int pid)
+{
+    fprintf(f, "[");
+    int first = 1;
+    if (err) {
+        fprintf(f, "{\"err\":\"%s\",\"pid\":%d}", err, pid);
+        first = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        fprintf(f, "%s{\"addr\":\"0x%llx\"}", first ? "" : ",",
+                (unsigned long long)addrs[i]);
+        first = 0;
+    }
+    fprintf(f, "]");
+}
+
+/* Failure modes are kept distinct so the trace says WHICH link broke:
+ *   [{"err":"stack_lookup_failed",...}]           map/ID problem (kernel side)
+ *   [{"err":"symbolize_failed",...},{"addr":..}]  addrs OK, blazesym got 0 frames
+ *                                                 (dead pid, missing perf-map, ...)
+ *   [{"addr":..},...]                             symbolization disabled
+ *   [{"sym":..},...]                              resolved
+ * An empty [] is only emitted for a stack that genuinely had 0 frames.
+ */
 static void emit_stack_json(FILE *f, int stack_id, int pid)
 {
     __u64 addrs[PERF_MAX_STACK_DEPTH];
     int n = read_stack_addrs(stack_id, addrs, PERF_MAX_STACK_DEPTH);
+    if (n < 0) {
+        stacks_lookup_failed++;
+        fprintf(f, "[{\"err\":\"stack_lookup_failed\",\"stack_id\":%d}]", stack_id);
+        return;
+    }
     if (n == 0) {
         fprintf(f, "[]");
         return;
@@ -192,12 +300,8 @@ static void emit_stack_json(FILE *f, int stack_id, int pid)
 
     if (!symbolize_enabled || symbolizer == NULL) {
         /* Fallback: raw addresses. Still useful for grep/manual addr2line. */
-        fprintf(f, "[");
-        for (int i = 0; i < n; i++) {
-            fprintf(f, "%s{\"addr\":\"0x%llx\"}", i ? "," : "",
-                    (unsigned long long)addrs[i]);
-        }
-        fprintf(f, "]");
+        stacks_raw++;
+        emit_raw_frames(f, addrs, n, NULL, pid);
         return;
     }
 
@@ -210,8 +314,16 @@ static void emit_stack_json(FILE *f, int stack_id, int pid)
     }
 
     size_t nout = bsw_resolve(symbolizer, (uint32_t)pid,
-                              addrs, (size_t)n,
+                              (const uint64_t *)addrs, (size_t)n,
                               frames, (size_t)frame_cap);
+
+    if (nout == 0) {
+        stacks_symbolize_failed++;
+        emit_raw_frames(f, addrs, n, "symbolize_failed", pid);
+        free(frames);
+        return;
+    }
+    stacks_ok++;
 
     fprintf(f, "[");
     char esc_sym[BSW_STR_MAX * 2];
@@ -244,6 +356,38 @@ static int compare_events(const void *a, const void *b)
     if (ea->timestamp < eb->timestamp) return -1;
     if (ea->timestamp > eb->timestamp) return 1;
     return 0;
+}
+
+/* Per-thread scheduling state for building on/off-CPU spans. Small
+ * open-addressing table keyed by tid; replaces an 80 MB calloc indexed
+ * by tid. tid 0 (idle) is never inserted, so 0 marks an empty slot.
+ */
+struct tid_state {
+    __u32 tid;
+    __u64 on_ts;        /* last switch-on time, 0 = not on CPU */
+    __u64 off_ts;       /* last switch-off time, 0 = unknown */
+    __u64 off_state;    /* task state at switch-off (0 = preempted) */
+    __s32 off_stack;    /* off-CPU user stack id, -1 = none */
+};
+#define TID_TABLE_SIZE 65536u   /* power of two */
+static struct tid_state *tid_table;
+
+static struct tid_state *tid_get(__u32 tid)
+{
+    if (!tid_table || tid == 0)
+        return NULL;
+    __u32 idx = (tid * 2654435761u) & (TID_TABLE_SIZE - 1);
+    for (__u32 probe = 0; probe < TID_TABLE_SIZE; probe++) {
+        struct tid_state *ts = &tid_table[(idx + probe) & (TID_TABLE_SIZE - 1)];
+        if (ts->tid == tid)
+            return ts;
+        if (ts->tid == 0) {
+            ts->tid = tid;
+            ts->off_stack = -1;
+            return ts;
+        }
+    }
+    return NULL; /* table full: drop span tracking for this tid */
 }
 
 static void output_chrome_tracing_json(const char *filename)
@@ -279,11 +423,10 @@ static void output_chrome_tracing_json(const char *filename)
     fprintf(f, "{\n");
     fprintf(f, "  \"traceEvents\": [\n");
     
-    /* Track thread states for duration events - use dynamic allocation to avoid stack overflow */
-    /* Allocate large enough to handle high PIDs (up to 10 million) */
-    __u64 *cpu_on_time = calloc(10000000, sizeof(__u64));
-    if (!cpu_on_time) {
-        fprintf(stderr, "ERROR: Failed to allocate memory for cpu_on_time tracking\n");
+    /* Per-thread on/off-CPU state for building spans. */
+    tid_table = calloc(TID_TABLE_SIZE, sizeof(*tid_table));
+    if (!tid_table) {
+        fprintf(stderr, "ERROR: Failed to allocate tid table\n");
         fclose(f);
         return;
     }
@@ -322,11 +465,39 @@ static void output_chrome_tracing_json(const char *filename)
             /* CPU scheduling event */
             struct cpu_sched_event *cpu = &e->cpu;
             
+            struct tid_state *ts = tid_get(cpu->tid);
+
             if (cpu->event_type == CPU_SCHED_ON) {
-                /* Thread scheduled on CPU - start duration  */
-                /* Bounds check to avoid segfault */
-                if (cpu->tid < 10000000) {
-                    cpu_on_time[cpu->tid] = e->timestamp;
+                /* Close the preceding off-CPU span, if we saw this thread
+                 * go off. Blocked spans (state != 0) carry the stack of
+                 * where the thread blocked -- the "why was the agent
+                 * waiting" answer. Preempted spans (state == 0) are
+                 * run-queue wait: runnable but no CPU.
+                 */
+                if (ts && ts->off_ts != 0 && e->timestamp >= ts->off_ts) {
+                    double off_ts_us = (ts->off_ts - min_timestamp) / 1000.0;
+                    double off_dur_us = (e->timestamp - ts->off_ts) / 1000.0;
+                    int blocked = ts->off_state != 0;
+                    if (output_count > 0) fprintf(f, ",\n");
+                    fprintf(f, "    {\"name\": \"%s\", \"cat\": \"%s\", "
+                            "\"ph\": \"X\", \"ts\": %.3f, \"dur\": %.3f, "
+                            "\"pid\": %u, \"tid\": %u, "
+                            "\"args\": {\"state\": %llu",
+                            blocked ? "Off-CPU (blocked)" : "Runnable (preempted)",
+                            blocked ? "cpu_off" : "cpu_runq",
+                            off_ts_us, off_dur_us, cpu->pid, cpu->tid,
+                            (unsigned long long)ts->off_state);
+                    if (ts->off_stack >= 0) {
+                        fprintf(f, ", \"stack\": ");
+                        emit_stack_json(f, ts->off_stack, cpu->pid);
+                    }
+                    fprintf(f, "}}");
+                    output_count++;
+                }
+                if (ts) {
+                    ts->on_ts = e->timestamp;
+                    ts->off_ts = 0;
+                    ts->off_stack = -1;
                 }
 
                 if (output_count > 0) fprintf(f, ",\n");
@@ -334,33 +505,29 @@ static void output_chrome_tracing_json(const char *filename)
                 /* Keep name consistent as "On-CPU" so Begin/End events match */
                 fprintf(f, "    {\"name\": \"On-CPU\", \"cat\": \"cpu\", "
                         "\"ph\": \"B\", \"ts\": %.3f, \"pid\": %u, \"tid\": %u, "
-                        "\"args\": {\"cpu\": %u, \"comm\": \"%s\"",
+                        "\"args\": {\"cpu\": %u, \"comm\": \"%s\"}}",
                         ts_us, cpu->pid, cpu->tid, cpu->cpu, cpu->comm);
-
-                /* Emit resolved stack as a structured array. The pid for
-                 * symbolization is the event's own pid so we can attribute
-                 * stacks from any process, not just the target.
-                 */
-                if (cpu->stack_id >= 0) {
-                    fprintf(f, ", \"stack\": ");
-                    emit_stack_json(f, cpu->stack_id, cpu->pid);
-                }
-
-                fprintf(f, "}}");
                 output_count++;
             } else if (cpu->event_type == CPU_SCHED_OFF) {
-                /* Thread switched off CPU - end duration */
-                if (cpu->tid < 10000000 && cpu_on_time[cpu->tid] != 0) {
-                    double dur_us = (e->timestamp - cpu_on_time[cpu->tid]) / 1000.0;
+                /* Thread switched off CPU - end the on-CPU duration and
+                 * remember the off-CPU start + stack for the next ON. */
+                if (ts && ts->on_ts != 0) {
+                    double dur_us = (e->timestamp - ts->on_ts) / 1000.0;
                     if (output_count > 0) fprintf(f, ",\n");
                     fprintf(f, "    {\"name\": \"On-CPU\", \"cat\": \"cpu\", "
                             "\"ph\": \"E\", \"ts\": %.3f, \"pid\": %u, \"tid\": %u, "
                             "\"args\": {\"duration_us\": %.3f, \"state\": %llu}}",
-                            ts_us, cpu->pid, cpu->tid, dur_us, cpu->prev_state);
-                    cpu_on_time[cpu->tid] = 0;
+                            ts_us, cpu->pid, cpu->tid, dur_us,
+                            (unsigned long long)cpu->prev_state);
+                    ts->on_ts = 0;
                     output_count++;
                 } else {
                     should_output = 0;
+                }
+                if (ts) {
+                    ts->off_ts = e->timestamp;
+                    ts->off_state = cpu->prev_state;
+                    ts->off_stack = cpu->stack_id;
                 }
             } else if (cpu->event_type == CPU_SCHED_WAKEUP) {
                 /* Instant event for wakeup */
@@ -454,11 +621,15 @@ static void output_chrome_tracing_json(const char *filename)
     fprintf(f, "  \"displayTimeUnit\": \"ms\",\n");
     fprintf(f, "  \"metadata\": {\n");
     fprintf(f, "    \"event_count\": %d,\n", event_count);
+    fprintf(f, "    \"stacks\": {\"ok\": %d, \"lookup_failed\": %d, "
+            "\"symbolize_failed\": %d, \"raw\": %d},\n",
+            stacks_ok, stacks_lookup_failed, stacks_symbolize_failed, stacks_raw);
     fprintf(f, "    \"tool\": \"ebpf-unified-trace\"\n");
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
     
-    free(cpu_on_time);
+    free(tid_table);
+    tid_table = NULL;
     fclose(f);
     printf("\n✓ Chrome Tracing JSON written to: %s\n", filename);
     printf("  Open in browser: chrome://tracing  (or https://ui.perfetto.dev)\n");
@@ -483,6 +654,7 @@ int main(int argc, char **argv)
     int symbolize_cli = 1;               /* default ON; --no-symbolize to disable */
     int sample_period_async = 8;         /* 1-in-8 by default for async ops */
     int sample_period_sync = 1;          /* every sync op by default */
+    int offcpu_stacks_cli = 1;           /* --no-offcpu-stacks to disable */
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -504,6 +676,10 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--stack-sample-sync") == 0 && i + 1 < argc) {
             sample_period_sync = atoi(argv[++i]);
             if (sample_period_sync <= 0) sample_period_sync = 1;
+        } else if (strcmp(argv[i], "--no-offcpu-stacks") == 0) {
+            offcpu_stacks_cli = 0;
+        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = 1;
         } else if (strcmp(argv[i], "--max-stack-frames") == 0 && i + 1 < argc) {
             max_stack_frames_in_json = atoi(argv[++i]);
             if (max_stack_frames_in_json <= 0) max_stack_frames_in_json = 12;
@@ -512,7 +688,7 @@ int main(int argc, char **argv)
                     "Usage: %s [--pid PID] [--duration SEC] [--output FILE]\n"
                     "          [--cuda-lib PATH] [--no-stacks] [--no-symbolize]\n"
                     "          [--stack-sample-async N] [--stack-sample-sync N]\n"
-                    "          [--max-stack-frames N]\n",
+                    "          [--max-stack-frames N] [--no-offcpu-stacks] [--verbose]\n",
                     argv[0]);
             return 1;
         }
@@ -549,43 +725,58 @@ int main(int argc, char **argv)
     printf("CUDA library: %s\n", cuda_lib_path);
     printf("Output: %s\n\n", output_file);
     
-    /* Enable libbpf logging for debugging */
-    libbpf_set_print(NULL);
-    
-    /* Load CPU scheduling BPF program */
+    /* libbpf logging: warnings always, debug/verifier output with --verbose. */
+    libbpf_set_print(libbpf_print_fn);
+
+    /* Remove a stale pin left by pre-reuse_fd builds (needs root; harmless
+     * if absent). Nothing pins stack_traces any more. */
+    if (unlink(STACK_TRACES_LEGACY_PIN_PATH) == 0)
+        printf("ℹ removed stale pinned map %s\n", STACK_TRACES_LEGACY_PIN_PATH);
+
+    /* ---- CPU scheduling object (optional: GPU tracing continues without it) */
     cpu_obj = bpf_object__open_file("obj/trace_cpu_sched.bpf.o", NULL);
     if (libbpf_get_error(cpu_obj)) {
-        fprintf(stderr, "ERROR: failed to open CPU BPF object\n");
-        goto cleanup;
+        fprintf(stderr, "WARNING: failed to open CPU BPF object; CPU tracing disabled\n");
+        cpu_obj = NULL;
     }
-    
-    /* Set target_pid filter for CPU tracing BEFORE loading */
-    if (target_pid != 0) {
-        struct bpf_map *rodata = bpf_object__find_map_by_name(cpu_obj, ".rodata");
-        if (rodata) {
-            bpf_map__set_initial_value(rodata, &target_pid, sizeof(target_pid));
+
+    if (cpu_obj) {
+        /* Must mirror struct sched_tracer_cfg in trace_cpu_sched.bpf.c. */
+        struct sched_tracer_cfg {
+            __u32 target_tgid;
+            __u8  offcpu_stacks;
+            __u8  _pad[3];
+        } sched_cfg = {
+            .target_tgid   = (__u32)target_pid,
+            .offcpu_stacks = (__u8)(offcpu_stacks_cli && capture_stacks_cli),
+        };
+        set_rodata(cpu_obj, "CPU", &sched_cfg, sizeof(sched_cfg));
+
+        err = bpf_object__load(cpu_obj);
+        if (err) {
+            fprintf(stderr, "WARNING: failed to load CPU BPF object: %d (%s); "
+                    "CPU tracing disabled. Re-run with --verbose for the libbpf/verifier log.\n"
+                    "         tp_btf programs need kernel BTF: check /sys/kernel/btf/vmlinux.\n",
+                    err, strerror(-err));
+            bpf_object__close(cpu_obj);
+            cpu_obj = NULL;
         }
     }
-    
-    err = bpf_object__load(cpu_obj);
-    if (err) {
-        fprintf(stderr, "ERROR: failed to load CPU BPF object: %d\n", err);
-        goto cleanup;
+
+    if (cpu_obj) {
+        /* The CPU object owns the stack map; the GPU object reuses it. */
+        struct bpf_map *stack_map = bpf_object__find_map_by_name(cpu_obj, "stack_traces");
+        if (stack_map) {
+            stack_map_fd = bpf_map__fd(stack_map);
+            target_pid_for_stacks = target_pid;
+        } else {
+            fprintf(stderr, "WARNING: stack_traces map not found in CPU object\n");
+        }
     }
-    
-    /* Get stack traces map for symbol resolution */
-    struct bpf_map *stack_map = bpf_object__find_map_by_name(cpu_obj, "stack_traces");
-    if (stack_map) {
-        stack_map_fd = bpf_map__fd(stack_map);
-        target_pid_for_stacks = target_pid;
-        printf("✓ Stack trace collection enabled\n");
-    } else {
-        fprintf(stderr, "WARNING: stack_traces map not found\n");
-    }
-    
-    /* Attach CPU scheduling tracepoints */
+
     struct bpf_program *prog;
-    prog = bpf_object__find_program_by_name(cpu_obj, "trace_sched_switch");
+    /* Attach CPU scheduling tracepoints */
+    prog = cpu_obj ? bpf_object__find_program_by_name(cpu_obj, "trace_sched_switch") : NULL;
     if (prog) {
         sched_switch_link = bpf_program__attach(prog);
         if (!libbpf_get_error(sched_switch_link)) {
@@ -594,10 +785,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "WARNING: Failed to attach sched_switch\n");
         }
     } else {
-        fprintf(stderr, "WARNING: sched_switch program not found\n");
+        fprintf(stderr, "WARNING: sched_switch program not attached\n");
     }
     
-    prog = bpf_object__find_program_by_name(cpu_obj, "trace_sched_wakeup");
+    prog = cpu_obj ? bpf_object__find_program_by_name(cpu_obj, "trace_sched_wakeup") : NULL;
     if (prog) {
         sched_wakeup_link = bpf_program__attach(prog);
         if (!libbpf_get_error(sched_wakeup_link)) {
@@ -606,7 +797,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "WARNING: Failed to attach sched_wakeup\n");
         }
     } else {
-        fprintf(stderr, "WARNING: sched_wakeup program not found\n");
+        fprintf(stderr, "WARNING: sched_wakeup program not attached\n");
     }
     
     /* Load GPU CUDA BPF program */
@@ -638,42 +829,41 @@ int main(int argc, char **argv)
         .sample_period_async = (__u32)sample_period_async,
         .capture_stacks      = (__u8)capture_stacks_cli,
     };
-    /* Find the .rodata map by its actual libbpf-assigned name. Newer
-     * libbpf prefixes the section with the object name (e.g.
-     * "trace_cu.rodata") so a plain ".rodata" lookup fails silently.
-     * Fall back to scanning all maps if the literal name isn't found.
-     */
-    struct bpf_map *gpu_rodata = bpf_object__find_map_by_name(gpu_obj, ".rodata");
-    if (!gpu_rodata) {
-        struct bpf_map *m;
-        bpf_object__for_each_map(m, gpu_obj) {
-            const char *name = bpf_map__name(m);
-            if (name && strstr(name, ".rodata")) {
-                gpu_rodata = m;
-                break;
-            }
+    set_rodata(gpu_obj, "GPU", &gpu_cfg, sizeof(gpu_cfg));
+
+    /* Share ONE stack map between the CPU and GPU objects. Without this
+     * each object gets its own map, GPU stack ids get looked up in the
+     * CPU map, and every GPU stack comes back empty. */
+    if (stack_map_fd >= 0) {
+        struct bpf_map *gpu_stack_map = bpf_object__find_map_by_name(gpu_obj, "stack_traces");
+        if (!gpu_stack_map) {
+            fprintf(stderr, "WARNING: stack_traces map not found in GPU object\n");
+        } else if ((err = bpf_map__reuse_fd(gpu_stack_map, stack_map_fd)) != 0) {
+            fprintf(stderr, "WARNING: bpf_map__reuse_fd(stack_traces) failed: %d (%s); "
+                    "GPU stacks will not resolve\n", err, strerror(-err));
         }
-    }
-    if (gpu_rodata) {
-        size_t actual_sz = bpf_map__value_size(gpu_rodata);
-        if (actual_sz != sizeof(gpu_cfg)) {
-            fprintf(stderr,
-                    "WARNING: GPU .rodata size mismatch (kernel=%zu, user=%zu); "
-                    "PID filter and stack sampling may be ignored.\n",
-                    actual_sz, sizeof(gpu_cfg));
-        }
-        int rc = bpf_map__set_initial_value(gpu_rodata, &gpu_cfg, sizeof(gpu_cfg));
-        if (rc) {
-            fprintf(stderr, "WARNING: failed to set GPU .rodata: %d\n", rc);
-        }
-    } else {
-        fprintf(stderr, "WARNING: GPU .rodata map not found; using defaults\n");
     }
 
     err = bpf_object__load(gpu_obj);
     if (err) {
-        fprintf(stderr, "ERROR: failed to load GPU BPF object: %d\n", err);
+        fprintf(stderr, "ERROR: failed to load GPU BPF object: %d (%s)\n", err, strerror(-err));
         goto cleanup;
+    }
+
+    {
+        int gpu_stack_fd = bpf_object__find_map_fd_by_name(gpu_obj, "stack_traces");
+        if (stack_map_fd < 0) {
+            /* CPU object unavailable: GPU object owns the stack map. */
+            stack_map_fd = gpu_stack_fd;
+            target_pid_for_stacks = target_pid;
+        }
+        __u32 cpu_id = cpu_obj ? map_id_of(bpf_object__find_map_fd_by_name(cpu_obj, "stack_traces")) : 0;
+        __u32 gpu_id = map_id_of(gpu_stack_fd);
+        if (cpu_obj && cpu_id != gpu_id)
+            fprintf(stderr, "WARNING: CPU and GPU stack maps differ (id %u vs %u); "
+                    "stack ids will not resolve consistently\n", cpu_id, gpu_id);
+        else if (stack_map_fd >= 0)
+            printf("✓ Stack trace collection enabled (shared map id %u)\n", gpu_id);
     }
     
     /* Attach CUDA uprobes. Failure for any single function is non-fatal
@@ -763,17 +953,18 @@ int main(int argc, char **argv)
                sample_period_sync, sample_period_async);
     }
     
-    /* Set up ring buffers */
-    cpu_map_fd = bpf_object__find_map_fd_by_name(cpu_obj, "cpu_events");
-    if (cpu_map_fd < 0) {
-        fprintf(stderr, "ERROR: failed to find cpu_events map\n");
-        goto cleanup;
-    }
-    
-    cpu_rb = ring_buffer__new(cpu_map_fd, handle_cpu_event, NULL, NULL);
-    if (!cpu_rb) {
-        fprintf(stderr, "ERROR: failed to create CPU ring buffer\n");
-        goto cleanup;
+    /* Set up ring buffers (CPU one only if the sched object loaded) */
+    if (cpu_obj) {
+        cpu_map_fd = bpf_object__find_map_fd_by_name(cpu_obj, "cpu_events");
+        if (cpu_map_fd < 0) {
+            fprintf(stderr, "ERROR: failed to find cpu_events map\n");
+            goto cleanup;
+        }
+        cpu_rb = ring_buffer__new(cpu_map_fd, handle_cpu_event, NULL, NULL);
+        if (!cpu_rb) {
+            fprintf(stderr, "ERROR: failed to create CPU ring buffer\n");
+            goto cleanup;
+        }
     }
     
     gpu_map_fd = bpf_object__find_map_fd_by_name(gpu_obj, "cuda_events");
@@ -798,20 +989,48 @@ int main(int argc, char **argv)
     
     /* Poll for events */
     while (!exiting) {
-        err = ring_buffer__poll(cpu_rb, 10);
-        if (err == -EINTR) break;
+        if (cpu_rb) {
+            err = ring_buffer__poll(cpu_rb, 10);
+            if (err == -EINTR) break;
+        }
         
         err = ring_buffer__poll(gpu_rb, 10);
         if (err == -EINTR) break;
     }
     
     printf("\nCollected %d events. Processing...\n", event_count);
+    if (event_count >= MAX_EVENTS)
+        fprintf(stderr, "WARNING: hit MAX_EVENTS (%d); later events were dropped\n", MAX_EVENTS);
+
+    /* Report kernel-side ring-buffer drops (per-CPU counter). */
+    if (cpu_obj) {
+        int drops_fd = bpf_object__find_map_fd_by_name(cpu_obj, "cpu_drops");
+        int ncpu = libbpf_num_possible_cpus();
+        if (drops_fd >= 0 && ncpu > 0) {
+            __u64 *vals = calloc(ncpu, sizeof(__u64));
+            __u32 key = 0;
+            if (vals && bpf_map_lookup_elem(drops_fd, &key, vals) == 0) {
+                __u64 total = 0;
+                for (int c = 0; c < ncpu; c++) total += vals[c];
+                if (total)
+                    fprintf(stderr, "WARNING: %llu CPU sched events dropped "
+                            "(ring buffer full); use --pid to narrow\n",
+                            (unsigned long long)total);
+            }
+            free(vals);
+        }
+    }
     
     /* Sort events by timestamp */
     qsort(events, event_count, sizeof(struct unified_event), compare_events);
     
     /* Output Chrome Tracing JSON */
     output_chrome_tracing_json(output_file);
+    printf("  Stacks: %d resolved, %d lookup_failed, %d symbolize_failed, %d raw\n",
+           stacks_ok, stacks_lookup_failed, stacks_symbolize_failed, stacks_raw);
+    if (stacks_lookup_failed)
+        fprintf(stderr, "  NOTE: stack lookups failed (first errno %d: %s) -- stack map problem, "
+                "not symbolization.\n", stack_lookup_errno, strerror(stack_lookup_errno));
     
 cleanup:
     ring_buffer__free(cpu_rb);

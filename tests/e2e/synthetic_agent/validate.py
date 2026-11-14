@@ -59,7 +59,9 @@ class State:
     gpu_event_count: int = 0
     cpu_event_count: int = 0
     stack_present_count: int = 0
-    stack_nonempty_count: int = 0
+    stack_nonempty_count: int = 0      # >= 1 resolved symbol frame
+    stack_lookup_failed: int = 0       # tracer: stack id not in stack map
+    stack_symbolize_failed: int = 0    # tracer: addrs found, blazesym got 0 frames
     total_duration_us: float = 0.0
 
 
@@ -93,8 +95,15 @@ def _parse_trace(path: Path) -> tuple[dict, State]:
         if "stack" in args:
             state.stack_present_count += 1
             stack = args["stack"]
-            if isinstance(stack, list) and len(stack) > 0:
-                state.stack_nonempty_count += 1
+            if isinstance(stack, list) and stack:
+                err = stack[0].get("err") if isinstance(stack[0], dict) else None
+                if err == "stack_lookup_failed":
+                    state.stack_lookup_failed += 1
+                elif err == "symbolize_failed":
+                    state.stack_symbolize_failed += 1
+                elif any(isinstance(fr, dict) and fr.get("sym") not in (None, "", "??")
+                         for fr in stack):
+                    state.stack_nonempty_count += 1
         if e.get("ph") == "X" and e.get("dur"):
             state.total_duration_us += e["dur"]
     return data, state
@@ -135,7 +144,9 @@ def phase_0_assertions(state: State) -> list[Result]:
     rs.append(Result(
         "stack arrays are non-empty (blazesym resolved frames)",
         "PASS" if state.stack_nonempty_count > 0 else "FAIL",
-        f"{state.stack_nonempty_count}/{state.stack_present_count} resolved",
+        f"{state.stack_nonempty_count}/{state.stack_present_count} resolved "
+        f"({state.stack_lookup_failed} lookup_failed, "
+        f"{state.stack_symbolize_failed} symbolize_failed)",
         phase=0,
     ))
     return rs
@@ -395,6 +406,8 @@ def _write_markdown_report(
     lines.append(f"- CPU events: {state.cpu_event_count}")
     lines.append(f"- Stack arrays attempted: {state.stack_present_count}")
     lines.append(f"- Stack arrays non-empty (blazesym resolved): {state.stack_nonempty_count}")
+    lines.append(f"- Stack lookups failed (stack map problem): {state.stack_lookup_failed}")
+    lines.append(f"- Stacks found but unsymbolized (blazesym/pid problem): {state.stack_symbolize_failed}")
     lines.append("")
     lines.append("## Per-phase assertion status")
     lines.append("")
