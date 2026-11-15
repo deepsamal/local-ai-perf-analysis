@@ -34,6 +34,37 @@ A non-elevated run therefore gives GPU spans only. Processes that start
 mid-capture are then picked up only if they submit GPU work and were in
 the start-up snapshot.
 
+## Stacks (`--stacks`, Administrator)
+
+`--stacks` turns on kernel stack walking for three event types, and adds a
+module rundown and DbgHelp symbolisation at the end of the capture:
+
+| Event | Stack shows | Where it lands |
+|---|---|---|
+| CSwitch | where the thread was waiting | `args.stack` on each *Off-CPU (blocked)* span; `<output>.offcpu.folded`, weighted by µs blocked |
+| ReadyThread | who woke it, and from where | `args.woken_by` and `args.waker_stack` on the blocked span |
+| SampledProfile (1 kHz) | what the thread was doing on-CPU | `<output>.oncpu.folded`; hot frames printed in the summary |
+
+Threads are labelled with their name, or failing that their resolved entry
+point (`ggml-cuda.dll!...`, `ntdll.dll!TppWorkerThread`), instead of a bare
+tid. Open the `.folded` files in speedscope.app or flamegraph.pl.
+
+Symbols resolve as far as the binaries allow:
+
+* With no `--symbol-path` (and no `_NT_SYMBOL_PATH`), you get export names.
+  A frame more than 256 KB past the nearest export shows as
+  `module+0xoffset` rather than under a misleading name.
+* `--symbol-path "srv*C:\symbols*https://msdl.microsoft.com/download/symbols"`
+  gives full names for Windows components. This also needs `symsrv.dll`
+  next to the `dbghelp.dll` in use; both come with the Windows SDK
+  Debugging Tools.
+* Go binaries (`ollama.exe`) carry no PDB, so their frames stay
+  `ollama.exe+0x...` until a Go symbol-table reader is added.
+
+Stack walking happens system-wide on every context switch. That is the same
+cost WPR pays, but keep captures short (≤ 30 s). The summary warns if the
+session lost events.
+
 ## Usage
 
 ```powershell
@@ -70,8 +101,7 @@ the analysis on a saved capture without re-tracing.
 
 ## Not yet
 
-* Stacks. The plan is ETW StackWalk on CSwitch/ReadyThread, symbolised with
-  DbgHelp.
+* Go symbol table (pclntab) reader for `ollama.exe` frames.
 * Python frames. These will come from py-spy or similar, and the same gap
   exists on Linux.
 * HTTP-level semantics for Ollama/OpenAI-compatible APIs (load, prefill and

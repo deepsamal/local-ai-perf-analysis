@@ -7,17 +7,18 @@
 //! `LiveFilter`; everything else happens offline in `spans.rs`.
 
 use crate::filter::LiveFilter;
-use crate::model::Raw;
+use crate::model::{Raw, StackOn};
 use crate::spans::Target;
 use anyhow::{anyhow, Result};
 use ferrisetw::parser::{Parser, Pointer};
 use ferrisetw::provider::kernel_providers::{
-    KernelProvider, CONTEXT_SWITCH_PROVIDER, MEMORY_HARD_FAULT_PROVIDER, PROCESS_PROVIDER,
-    THREAD_DISPATCHER_PROVIDER, THREAD_PROVIDER,
+    KernelProvider, CONTEXT_SWITCH_PROVIDER, IMAGE_LOAD_PROVIDER, MEMORY_HARD_FAULT_PROVIDER,
+    PROCESS_PROVIDER, PROFILE_PROVIDER, THREAD_DISPATCHER_PROVIDER, THREAD_PROVIDER,
 };
 use ferrisetw::provider::{EventFilter, Provider};
 use ferrisetw::{EventRecord, KernelTrace, SchemaLocator, UserTrace, GUID};
-use std::collections::BTreeMap;
+use crate::winsys;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +46,10 @@ pub struct Options {
     pub gpu: bool,
     pub net: bool,
     pub verbose: bool,
+    /// Stack walks on CSwitch/ReadyThread + 1 kHz SampledProfile, module
+    /// rundown and DbgHelp symbolisation (kernel session, Administrator).
+    pub stacks: bool,
+    pub symbol_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -55,6 +60,18 @@ pub struct Shared {
     pub parse_errors: BTreeMap<String, u64>,
     /// (provider, event id/opcode) -> count, for --verbose diagnostics
     pub seen: BTreeMap<String, u64>,
+    /// Thread whose next StackWalk event belongs to the given kept event.
+    pub stack_owner: HashMap<u32, (i64, Owner)>,
+    pub stack_stats: BTreeMap<String, u64>,
+    pub path_map: Option<winsys::PathMap>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Owner {
+    CSwitchNew,
+    CSwitchOld,
+    Ready,
+    Sample,
 }
 
 pub struct CaptureResult {
@@ -67,6 +84,9 @@ pub struct CaptureResult {
     pub kept: u64,
     pub dropped: u64,
     pub elapsed: Duration,
+    pub stack_stats: BTreeMap<String, u64>,
+    pub kernel_stats: Option<winsys::SessionStats>,
+    pub user_stats: Option<winsys::SessionStats>,
 }
 
 type Sh = Arc<Mutex<Shared>>;
@@ -75,6 +95,21 @@ fn push(sh: &Sh, r: Raw) {
     if let Ok(mut s) = sh.lock() {
         if s.filter.observe(&r) {
             s.events.push(r);
+        }
+    }
+}
+
+/// Push an event; if kept, remember which threads' next stack walk belongs to it.
+fn push_owned(sh: &Sh, r: Raw, owners: &[(u32, Owner)]) {
+    if let Ok(mut s) = sh.lock() {
+        if s.filter.observe(&r) {
+            let ts = r.ts();
+            s.events.push(r);
+            for (tid, o) in owners {
+                if *tid != 0 {
+                    s.stack_owner.insert(*tid, (ts, *o));
+                }
+            }
         }
     }
 }
@@ -150,30 +185,58 @@ fn kernel_thread_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send +
     move |rec, loc| {
         let op = rec.opcode();
         let tag = format!("Thread/op{op}");
-        if !matches!(op, 1 | 2 | 3 | 4 | 36 | 50) {
+        if !matches!(op, 1..=4 | 36 | 50 | 72) {
             return;
         }
         let Some((schema, tag)) = parser!(&sh, rec, loc, tag) else { return };
         let p = P { p: Parser::create(rec, &schema), sh: &sh, tag: &tag };
         let ts = rec.raw_timestamp();
-        let r = match op {
-            1..=4 => match (p.u32("ProcessId"), p.u32("TThreadId")) {
-                (Some(pid), Some(tid)) => Raw::Thread { ts, pid, tid, start: op == 1 || op == 3 },
-                _ => return,
-            },
-            36 => match (p.u32("NewThreadId"), p.u32("OldThreadId"), p.i8("OldThreadState"), p.i8("OldThreadWaitReason")) {
-                (Some(new_tid), Some(old_tid), Some(old_state), Some(wait_reason)) => {
-                    Raw::CSwitch { ts, new_tid, old_tid, old_state, wait_reason }
+        match op {
+            1..=4 => {
+                if let (Some(pid), Some(tid)) = (p.u32("ProcessId"), p.u32("TThreadId")) {
+                    let start = op == 1 || op == 3;
+                    push(&sh, Raw::Thread { ts, pid, tid, start });
+                    if start {
+                        // Optional fields: silently absent on older schemas.
+                        let start_addr = p.p.try_parse::<Pointer>("Win32StartAddr").map(|v| *v as u64).unwrap_or(0);
+                        let name = p.p.try_parse::<String>("ThreadName").unwrap_or_default();
+                        if start_addr != 0 || !name.is_empty() {
+                            push(&sh, Raw::ThreadInfo { ts, pid, tid, start_addr, name });
+                        }
+                    }
                 }
-                _ => return,
-            },
-            50 => match p.u32("TThreadId") {
-                Some(tid) => Raw::Ready { ts, tid },
-                None => return,
-            },
-            _ => return,
-        };
-        push(&sh, r);
+            }
+            72 => {
+                // Thread SetName (Windows 10 1709+)
+                let tid = p.p.try_parse::<u32>("ThreadId").or_else(|_| p.p.try_parse::<u32>("TThreadId"));
+                if let (Ok(tid), Ok(name)) = (tid, p.p.try_parse::<String>("ThreadName")) {
+                    let pid = p.p.try_parse::<u32>("ProcessId").unwrap_or(0);
+                    push(&sh, Raw::ThreadInfo { ts, pid, tid, start_addr: 0, name });
+                }
+            }
+            36 => {
+                if let (Some(new_tid), Some(old_tid), Some(old_state), Some(wait_reason)) =
+                    (p.u32("NewThreadId"), p.u32("OldThreadId"), p.i8("OldThreadState"), p.i8("OldThreadWaitReason"))
+                {
+                    push_owned(
+                        &sh,
+                        Raw::CSwitch { ts, new_tid, old_tid, old_state, wait_reason },
+                        &[(old_tid, Owner::CSwitchOld), (new_tid, Owner::CSwitchNew)],
+                    );
+                }
+            }
+            50 => {
+                if let Some(tid) = p.u32("TThreadId") {
+                    // Logged in the context of the thread doing the waking.
+                    let (mut waker_pid, mut waker_tid) = (rec.process_id(), rec.thread_id());
+                    if waker_tid == u32::MAX {
+                        (waker_pid, waker_tid) = (0, 0);
+                    }
+                    push_owned(&sh, Raw::Ready { ts, tid, waker_pid, waker_tid }, &[(waker_tid, Owner::Ready)]);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -205,8 +268,98 @@ fn kernel_fault_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + 
     }
 }
 
+fn kernel_profile_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 'static {
+    move |rec, loc| {
+        if rec.opcode() != 46 {
+            return;
+        }
+        let Some((schema, tag)) = parser!(&sh, rec, loc, "PerfInfo/op46".to_string()) else { return };
+        let p = P { p: Parser::create(rec, &schema), sh: &sh, tag: &tag };
+        if let Some(tid) = p.u32("ThreadId") {
+            push_owned(&sh, Raw::Sample { ts: rec.raw_timestamp(), tid }, &[(tid, Owner::Sample)]);
+        }
+    }
+}
+
+fn kernel_image_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 'static {
+    move |rec, loc| {
+        let op = rec.opcode();
+        // 10 = Load, 3 = DCStart (rundown of already-loaded modules)
+        if op != 10 && op != 3 {
+            return;
+        }
+        let Some((schema, tag)) = parser!(&sh, rec, loc, format!("Image/op{op}")) else { return };
+        let p = P { p: Parser::create(rec, &schema), sh: &sh, tag: &tag };
+        if let (Some(base), Some(size), Some(pid), Some(path)) =
+            (p.ptr("ImageBase"), p.ptr("ImageSize"), p.u32("ProcessId"), p.string("FileName"))
+        {
+            let path = match sh.lock().ok().and_then(|s| s.path_map.as_ref().map(|m| m.to_dos(&path))) {
+                Some(p) => p,
+                None => path,
+            };
+            push(&sh, Raw::Image { ts: rec.raw_timestamp(), pid, base, size, path });
+        }
+    }
+}
+
+/// StackWalk_Event (opcode 32): u64 EventTimeStamp, u32 StackProcess,
+/// u32 StackThread, then leaf-first return addresses. Parsed from the raw
+/// payload: TDH would need one lookup per Stack1..Stack192 property.
+fn kernel_stack_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 'static {
+    move |rec, _| {
+        if rec.opcode() != 32 {
+            return;
+        }
+        // SAFETY: ferrisetw's EventRecord is #[repr(transparent)] over EVENT_RECORD.
+        let er = unsafe { &*(rec as *const EventRecord as *const windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD) };
+        if er.UserData.is_null() || er.UserDataLength < 16 {
+            return;
+        }
+        let data = unsafe { std::slice::from_raw_parts(er.UserData as *const u8, er.UserDataLength as usize) };
+        let ptr = if rec.event_flags() & 0x0020 != 0 { 4 } else { 8 }; // EVENT_HEADER_FLAG_32_BIT_HEADER
+        let tid = u32::from_le_bytes(data[12..16].try_into().unwrap());
+        let frames: Vec<u64> = data[16..]
+            .chunks_exact(ptr)
+            .map(|c| if ptr == 8 { u64::from_le_bytes(c.try_into().unwrap()) } else { u32::from_le_bytes(c.try_into().unwrap()) as u64 })
+            .collect();
+        if let Ok(mut s) = sh.lock() {
+            match s.stack_owner.remove(&tid) {
+                Some((ts, o)) => {
+                    let on = match o {
+                        Owner::CSwitchNew | Owner::CSwitchOld => StackOn::CSwitch,
+                        Owner::Ready => StackOn::Ready,
+                        Owner::Sample => StackOn::Sample,
+                    };
+                    // A CSwitch registers both threads; drop the sibling entry
+                    // so it cannot capture a later, unrelated stack.
+                    if matches!(o, Owner::CSwitchNew | Owner::CSwitchOld) {
+                        let sib = s.stack_owner.iter().find(|(_, v)| v.0 == ts && matches!(v.1, Owner::CSwitchNew | Owner::CSwitchOld)).map(|(k, _)| *k);
+                        if let Some(k) = sib {
+                            s.stack_owner.remove(&k);
+                        }
+                    }
+                    *s.stack_stats.entry(format!("matched_{o:?}")).or_default() += 1;
+                    s.events.push(Raw::Stack { ts, tid, on, frames });
+                }
+                None => *s.stack_stats.entry("unmatched".into()).or_default() += 1,
+            }
+        }
+    }
+}
+
+const KERNEL_SESSION: &str = "lapa-etw-kernel";
+
 fn start_kernel(sh: &Sh, o: &Options) -> Result<KernelTrace> {
-    let mut b = KernelTrace::new().named("lapa-etw-kernel".to_string());
+    let mut b = KernelTrace::new().named(KERNEL_SESSION.to_string());
+    if o.stacks {
+        // Stack walks on every context switch are bulky: bigger buffers.
+        b = b.set_trace_properties(ferrisetw::trace::TraceProperties {
+            buffer_size: 1024,
+            min_buffer: 64,
+            max_buffer: 512,
+            ..Default::default()
+        });
+    }
     // Thread class carries CSwitch (CSWITCH flag) and ReadyThread
     // (DISPATCHER flag) in addition to thread start/end/rundown.
     let mut tflags = THREAD_PROVIDER.flags;
@@ -218,6 +371,14 @@ fn start_kernel(sh: &Sh, o: &Options) -> Result<KernelTrace> {
     b = b.enable(Provider::kernel(&PROCESS_PROVIDER).add_callback(kernel_process_cb(sh.clone())).build());
     if o.faults {
         b = b.enable(Provider::kernel(&MEMORY_HARD_FAULT_PROVIDER).add_callback(kernel_fault_cb(sh.clone())).build());
+    }
+    if o.stacks {
+        b = b.enable(Provider::kernel(&IMAGE_LOAD_PROVIDER).add_callback(kernel_image_cb(sh.clone())).build());
+        if o.cpu {
+            b = b.enable(Provider::kernel(&PROFILE_PROVIDER).add_callback(kernel_profile_cb(sh.clone())).build());
+        }
+        let walk = KernelProvider::new(GUID::from(winsys::STACKWALK_GUID), 0);
+        b = b.enable(Provider::kernel(&walk).add_callback(kernel_stack_cb(sh.clone())).build());
     }
     b.start_and_process().map_err(|e| anyhow!("{e:?}"))
 }
@@ -473,10 +634,26 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
     let (admin, perflog) = token_groups();
     notes.push(format!("token: elevated administrator = {admin}, Performance Log Users = {perflog}"));
 
-    let need_kernel = o.cpu || o.faults;
+    let need_kernel = o.cpu || o.faults || o.stacks;
+    if o.stacks {
+        sh.lock().unwrap().path_map = Some(winsys::PathMap::new());
+        if o.cpu {
+            if let Err(e) = winsys::enable_profile_privilege() {
+                notes.push(format!("on-CPU sampling may be unavailable: {e}"));
+            }
+        }
+    }
     let kernel = if need_kernel {
         match start_kernel(&sh, o) {
-            Ok(t) => Some(t),
+            Ok(t) => {
+                if o.stacks {
+                    match winsys::enable_stack_tracing(KERNEL_SESSION) {
+                        Ok(()) => notes.push("stack walking enabled on CSwitch, ReadyThread, SampledProfile".into()),
+                        Err(e) => notes.push(format!("stack walking unavailable: {e}")),
+                    }
+                }
+                Some(t)
+            }
             Err(e) => {
                 notes.push(format!(
                     "kernel session unavailable ({e}); CPU scheduling and hard-fault data disabled. \
@@ -515,6 +692,8 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
     let elapsed = t0.elapsed();
     let kernel_session = kernel.is_some();
     let user_session = user.is_some();
+    let kernel_stats = if kernel_session { winsys::session_stats(KERNEL_SESSION) } else { None };
+    let user_stats = if user_session { winsys::session_stats(USER_SESSION) } else { None };
     if let Some(k) = kernel {
         if let Err(e) = k.stop() {
             notes.push(format!("kernel session stop: {e:?}"));
@@ -527,8 +706,31 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
     }
 
     let mut s = sh.lock().unwrap();
+    let mut events = std::mem::take(&mut s.events);
+    if o.stacks {
+        let t = Instant::now();
+        let mut thread_pid = HashMap::new();
+        for r in &events {
+            if let Raw::Thread { pid, tid, start: true, .. } = r {
+                thread_pid.insert(*tid, *pid);
+            }
+        }
+        let wanted = crate::stacks::Symbols::wanted(&events, &thread_pid);
+        let (syms, st) = winsys::symbolize(&events, &wanted, o.symbol_path.as_deref());
+        notes.push(format!(
+            "symbolised {} addresses in {:.1}s: {:?}{}",
+            wanted.len(),
+            t.elapsed().as_secs_f64(),
+            st,
+            if o.symbol_path.is_none() { " (exports only; pass --symbol-path for PDB symbols)" } else { "" }
+        ));
+        events.extend(syms);
+    }
     Ok(CaptureResult {
-        events: std::mem::take(&mut s.events),
+        events,
+        stack_stats: std::mem::take(&mut s.stack_stats),
+        kernel_stats,
+        user_stats,
         kernel_session,
         user_session,
         notes,

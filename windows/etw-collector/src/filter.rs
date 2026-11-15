@@ -68,6 +68,12 @@ impl LiveFilter {
                 self.ctxs.contains(ctx)
             }
             Raw::Tcp { pid, .. } => self.pids.contains(pid),
+            // Cheap and needed to label threads that join the target later.
+            Raw::ThreadInfo { .. } => true,
+            Raw::Image { pid, .. } => *pid == 0 || self.pids.contains(pid),
+            Raw::Sample { tid, .. } => self.is_tid(*tid),
+            // The collector only emits stacks for events this filter kept.
+            Raw::Stack { .. } | Raw::Sym { .. } => true,
         };
         if keep {
             self.kept += 1;

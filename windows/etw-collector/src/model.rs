@@ -26,7 +26,29 @@ pub enum Raw {
     /// KWAIT_REASON of the outgoing thread.
     CSwitch { ts: Ts, new_tid: u32, old_tid: u32, old_state: i8, wait_reason: i8 },
     /// ReadyThread (kernel Thread class, opcode 50): `tid` became runnable.
-    Ready { ts: Ts, tid: u32 },
+    /// The event is logged by the thread that did the waking (`waker_*`;
+    /// 0 when unknown, e.g. woken from a DPC or an older capture).
+    Ready {
+        ts: Ts,
+        tid: u32,
+        #[serde(default)]
+        waker_pid: u32,
+        #[serde(default)]
+        waker_tid: u32,
+    },
+    /// Extra thread details: entry point and name (Thread start/rundown
+    /// Win32StartAddr + ThreadName, or the SetName event).
+    ThreadInfo { ts: Ts, pid: u32, tid: u32, start_addr: u64, name: String },
+    /// Module mapped into `pid` (pid 0 = kernel drivers), for symbolising.
+    Image { ts: Ts, pid: u32, base: u64, size: u64, path: String },
+    /// SampledProfile (PerfInfo class, opcode 46): `tid` was on-CPU.
+    Sample { ts: Ts, tid: u32 },
+    /// Call stack (leaf first) captured by ETW stack walking for the event of
+    /// kind `on` that `tid` logged/was the subject of at `ts`.
+    Stack { ts: Ts, tid: u32, on: StackOn, frames: Vec<u64> },
+    /// Symbol for an address in `pid` (pid 0 = kernel), resolved on the
+    /// capture machine so replays elsewhere stay readable.
+    Sym { pid: u32, addr: u64, name: String },
     /// Hard page fault serviced from disk (kernel PageFault class).
     HardFault { ts: Ts, tid: u32, bytes: u32 },
     /// DxgKrnl QueuePacket_Start: work queued by process `pid` on `ctx`.
@@ -48,15 +70,34 @@ impl Raw {
             | Raw::Thread { ts, .. }
             | Raw::CSwitch { ts, .. }
             | Raw::Ready { ts, .. }
+            | Raw::ThreadInfo { ts, .. }
+            | Raw::Image { ts, .. }
+            | Raw::Sample { ts, .. }
+            | Raw::Stack { ts, .. }
             | Raw::HardFault { ts, .. }
             | Raw::GpuQueueStart { ts, .. }
             | Raw::GpuQueueStop { ts, .. }
             | Raw::GpuDmaStart { ts, .. }
             | Raw::GpuDmaDone { ts, .. }
             | Raw::Tcp { ts, .. } => *ts,
+            Raw::Sym { .. } => 0,
         }
     }
 }
+
+/// Which event a stack belongs to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum StackOn {
+    /// Context switch: stack of the thread involved (where it blocked).
+    CSwitch,
+    /// ReadyThread: stack of the waker.
+    Ready,
+    /// SampledProfile: on-CPU sample.
+    Sample,
+}
+
+/// Addresses at or above this are kernel-mode on x64.
+pub const KERNEL_ADDR_MIN: u64 = 0xFFFF_8000_0000_0000;
 
 /// KTHREAD_STATE value for a thread that blocked (vs. was preempted).
 pub const THREAD_STATE_WAITING: i8 = 5;

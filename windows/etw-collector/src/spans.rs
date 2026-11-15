@@ -17,6 +17,7 @@
 //! Wait/Signal packets are synchronisation, not work, and are skipped.
 
 use crate::model::*;
+use crate::stacks::{folded_key, module_name, StackIndex, Symbols};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +63,8 @@ pub struct ProcSummary {
     pub tcp_sent_bytes: u64,
     pub tcp_recv_bytes: u64,
     pub threads: usize,
+    pub cpu_samples: u64,
+    pub blocked_spans_with_stack: u64,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +76,13 @@ pub struct Analysis {
     pub thread_pid: HashMap<u32, u32>,
     pub summary: BTreeMap<u32, ProcSummary>,
     pub unknown_tid_switches: u64,
+    /// (pid, tid) -> "name-or-entry-point (tid)"
+    pub thread_labels: BTreeMap<(u32, u32), String>,
+    /// Folded on-CPU sample stacks (weight = samples, ~1 ms each).
+    pub folded_oncpu: BTreeMap<String, u64>,
+    /// Folded blocked stacks (weight = microseconds blocked).
+    pub folded_offcpu: BTreeMap<String, u64>,
+    pub stacks_in_capture: usize,
 }
 
 fn us(t: Ts, t0: Ts) -> f64 {
@@ -121,6 +131,8 @@ struct ThreadCpu {
     blocked: bool,
     reason: i8,
     ready_at: Option<Ts>,
+    /// (waker pid, waker tid, ReadyThread ts) for the current blocked period
+    waker: Option<(u32, u32, Ts)>,
 }
 
 #[derive(Default)]
@@ -152,6 +164,34 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
         .filter_map(|r| if let Raw::GpuDmaDone { ctx, .. } = r { Some(*ctx) } else { None })
         .collect();
 
+    let stacks = StackIndex::build(&raw);
+    let syms = Symbols::build(&raw);
+    a.stacks_in_capture = stacks.len();
+    // Latest known name / entry point per thread id.
+    let mut tinfo: HashMap<u32, (u64, String)> = HashMap::new();
+    for r in &raw {
+        if let Raw::ThreadInfo { pid, tid, start_addr, name, .. } = r {
+            let e = tinfo.entry(*tid).or_insert((0, String::new()));
+            if *start_addr != 0 {
+                e.0 = *start_addr;
+            }
+            if !name.is_empty() {
+                e.1 = name.clone();
+            }
+            let _ = pid;
+        }
+    }
+    let thread_label = |pid: u32, tid: u32| -> String {
+        match tinfo.get(&tid) {
+            Some((_, n)) if !n.is_empty() => format!("{n} ({tid})"),
+            Some((sa, _)) if *sa != 0 => format!("{} ({tid})", syms.resolve(pid, *sa)),
+            _ => format!("thread {tid}"),
+        }
+    };
+    let proc_label = |names: &HashMap<u32, String>, pid: u32| -> String {
+        format!("{} ({pid})", names.get(&pid).map(|n| module_name(n)).unwrap_or_else(|| "?".into()))
+    };
+
     let mut cpu: HashMap<u32, ThreadCpu> = HashMap::new();
     let mut gpu: HashMap<u64, GpuCtx> = HashMap::new();
     let mut threads_seen: HashMap<u32, HashSet<u32>> = HashMap::new();
@@ -177,12 +217,29 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
                     cpu.remove(tid); // tid reuse: forget the old thread's state
                 }
             }
-            Raw::Ready { ts, tid } => {
+            Raw::Ready { ts, tid, waker_pid, waker_tid } => {
                 let st = cpu.entry(*tid).or_default();
                 if st.on_since.is_none() && st.ready_at.is_none() {
                     st.ready_at = Some(*ts);
+                    if *waker_tid != 0 {
+                        st.waker = Some((*waker_pid, *waker_tid, *ts));
+                    }
                 }
             }
+            Raw::Sample { ts, tid } => {
+                if let Some(&pid) = a.thread_pid.get(tid) {
+                    if targets.contains(&pid) {
+                        summ!(pid).cpu_samples += 1;
+                        let frames = stacks
+                            .get(*ts, *tid, StackOn::Sample)
+                            .map(|f| syms.frames(pid, f))
+                            .unwrap_or_else(|| vec!["[no stack]".into()]);
+                        let k = folded_key(&proc_label(&a.proc_names, pid), &thread_label(pid, *tid), &frames, None);
+                        *a.folded_oncpu.entry(k).or_default() += 1;
+                    }
+                }
+            }
+            Raw::ThreadInfo { .. } | Raw::Image { .. } | Raw::Stack { .. } | Raw::Sym { .. } => {}
             Raw::CSwitch { ts, new_tid, old_tid, old_state, wait_reason } => {
                 let ts = *ts;
                 // Outgoing thread.
@@ -210,6 +267,7 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
                     st.off_since = Some(ts);
                     st.blocked = *old_state == THREAD_STATE_WAITING;
                     st.reason = *wait_reason;
+                    st.waker = None;
                     // A preempted thread is runnable immediately.
                     st.ready_at = if st.blocked { None } else { Some(ts) };
                 }
@@ -224,6 +282,31 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
                             if st.blocked && ready > off {
                                 let dur = (ready - off) as f64 / 10.0;
                                 let reason = wait_reason_name(st.reason);
+                                let mut args = serde_json::json!({ "wait_reason": reason });
+                                // The CSwitch stack shows where the thread waited; depending
+                                // on the Windows build it is logged on the switch-in or the
+                                // switch-out of the waiting thread.
+                                let stack = stacks
+                                    .get(ts, *new_tid, StackOn::CSwitch)
+                                    .or_else(|| stacks.get(off, *new_tid, StackOn::CSwitch))
+                                    .map(|f| syms.frames(pid, f));
+                                if let Some((wpid, wtid, wts)) = st.waker {
+                                    let wname = a.proc_names.get(&wpid).map(|n| module_name(n)).unwrap_or_default();
+                                    args["woken_by"] = serde_json::json!(format!("{wname} pid {wpid} tid {wtid}"));
+                                    if let Some(f) = stacks.get(wts, wtid, StackOn::Ready) {
+                                        args["waker_stack"] = serde_json::json!(syms.frames(wpid, f));
+                                    }
+                                }
+                                if let Some(f) = &stack {
+                                    let k = folded_key(
+                                        &proc_label(&a.proc_names, pid),
+                                        &thread_label(pid, *new_tid),
+                                        f,
+                                        Some(&format!("[{reason}]")),
+                                    );
+                                    *a.folded_offcpu.entry(k).or_default() += dur.round() as u64;
+                                    args["stack"] = serde_json::json!(f);
+                                }
                                 a.spans.push(Span {
                                     name: "Off-CPU (blocked)".into(),
                                     cat: "cpu_off",
@@ -231,10 +314,13 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
                                     phase: Phase::Complete { dur_us: dur },
                                     pid,
                                     tid: *new_tid,
-                                    args: serde_json::json!({ "wait_reason": reason }),
+                                    args,
                                 });
                                 let s = summ!(pid);
                                 s.blocked_ms += dur / 1000.0;
+                                if stack.is_some() {
+                                    s.blocked_spans_with_stack += 1;
+                                }
                                 *s.blocked_by_reason_ms.entry(reason).or_default() += dur / 1000.0;
                             }
                             if ts > ready {
@@ -367,6 +453,12 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
         }
     }
 
+    let tracks: HashSet<(u32, u32)> = a.spans.iter().map(|s| (s.pid, s.tid)).collect();
+    for (pid, tid) in tracks {
+        if tid & 0xFFFF_0000 != 0xFFFF_0000 && tid & 0xFFFF_0000 != 0xFFFE_0000 {
+            a.thread_labels.insert((pid, tid), thread_label(pid, tid));
+        }
+    }
     for pid in &a.targets {
         let n = threads_seen.get(pid).map_or(0, |s| s.len());
         let name = a.proc_names.get(pid).cloned().unwrap_or_default();
@@ -420,7 +512,7 @@ mod tests {
             // 1000 runs at t=1000 (0.1ms), blocks at 2000 on UserRequest(6)
             Raw::CSwitch { ts: 1000, new_tid: 1000, old_tid: 0, old_state: 0, wait_reason: 0 },
             Raw::CSwitch { ts: 2000, new_tid: 0, old_tid: 1000, old_state: 5, wait_reason: 6 },
-            Raw::Ready { ts: 5000, tid: 1000 },
+            Raw::Ready { ts: 5000, tid: 1000, waker_pid: 0, waker_tid: 0 },
             Raw::CSwitch { ts: 6000, new_tid: 1000, old_tid: 3000, old_state: 1, wait_reason: 32 },
             Raw::CSwitch { ts: 7000, new_tid: 3000, old_tid: 1000, old_state: 1, wait_reason: 32 },
             Raw::CSwitch { ts: 9000, new_tid: 1000, old_tid: 3000, old_state: 1, wait_reason: 32 },
@@ -524,5 +616,39 @@ mod tests {
         ]);
         let a = analyze(raw, &tgt(false));
         assert!(a.spans.iter().all(|s| s.cat == "cpu_on"));
+    }
+
+    #[test]
+    fn stacks_wakers_samples_and_labels() {
+        let mut raw = base();
+        raw.extend([
+            Raw::ThreadInfo { ts: 0, pid: 100, tid: 1000, start_addr: 0x1100, name: String::new() },
+            Raw::ThreadInfo { ts: 0, pid: 200, tid: 2000, start_addr: 0, name: "decode".into() },
+            Raw::Image { ts: 0, pid: 100, base: 0x1000, size: 0x1000, path: "C:\\o\\ggml.dll".into() },
+            Raw::Sym { pid: 100, addr: 0x1100, name: "ggml.dll!worker".into() },
+            Raw::Sym { pid: 100, addr: 0x1200, name: "ggml.dll!wait".into() },
+            Raw::Sym { pid: 100, addr: 0x1300, name: "ggml.dll!compute".into() },
+            Raw::CSwitch { ts: 100, new_tid: 1000, old_tid: 0, old_state: 0, wait_reason: 0 },
+            Raw::Sample { ts: 150, tid: 1000 },
+            Raw::Stack { ts: 150, tid: 1000, on: StackOn::Sample, frames: vec![0x1300, 0x1100] },
+            Raw::CSwitch { ts: 200, new_tid: 0, old_tid: 1000, old_state: 5, wait_reason: 15 },
+            Raw::Ready { ts: 500, tid: 1000, waker_pid: 200, waker_tid: 2000 },
+            Raw::Stack { ts: 500, tid: 2000, on: StackOn::Ready, frames: vec![0xdead] },
+            Raw::CSwitch { ts: 600, new_tid: 1000, old_tid: 0, old_state: 0, wait_reason: 0 },
+            Raw::Stack { ts: 600, tid: 1000, on: StackOn::CSwitch, frames: vec![0x1200, 0x1100] },
+        ]);
+        let a = analyze(raw, &tgt(false));
+        let off = a.spans.iter().find(|s| s.cat == "cpu_off").unwrap();
+        assert_eq!(off.args["stack"], serde_json::json!(["ggml.dll!wait", "ggml.dll!worker"]));
+        assert_eq!(off.args["woken_by"], "ollama_llama_server.exe pid 200 tid 2000");
+        assert_eq!(off.args["waker_stack"], serde_json::json!(["0xdead"]));
+        assert_eq!(a.thread_labels[&(100, 1000)], "ggml.dll!worker (1000)");
+        assert_eq!(a.summary[&100].cpu_samples, 1);
+        assert_eq!(a.summary[&100].blocked_spans_with_stack, 1);
+        assert_eq!(
+            a.folded_oncpu.keys().next().unwrap(),
+            "ollama.exe (100);ggml.dll!worker (1000);ggml.dll!worker;ggml.dll!compute"
+        );
+        assert_eq!(a.folded_offcpu.values().next(), Some(&30)); // 300 ticks = 30 us
     }
 }

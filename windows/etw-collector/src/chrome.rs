@@ -24,7 +24,7 @@ pub fn to_json(a: &Analysis, meta: Value) -> Value {
         } else if *tid & 0xFFFF_0000 == gpu_track(0) & 0xFFFF_0000 {
             format!("GPU context #{:04x}", tid & 0xFFFF)
         } else {
-            format!("thread {tid}")
+            a.thread_labels.get(&(*pid, *tid)).cloned().unwrap_or_else(|| format!("thread {tid}"))
         };
         ev.push(json!({"ph":"M","name":"thread_name","pid":pid,"tid":tid,"args":{"name":label}}));
     }
@@ -61,6 +61,7 @@ pub fn to_json(a: &Analysis, meta: Value) -> Value {
     m.insert("target_pids".into(), json!(a.targets));
     m.insert("summary".into(), serde_json::to_value(&a.summary).unwrap_or(Value::Null));
     m.insert("unknown_tid_switches".into(), json!(a.unknown_tid_switches));
+    m.insert("stacks_in_capture".into(), json!(a.stacks_in_capture));
     json!({ "traceEvents": ev, "displayTimeUnit": "ms", "metadata": Value::Object(m) })
 }
 

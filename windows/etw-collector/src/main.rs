@@ -22,6 +22,11 @@ CAPTURE:
   --no-faults             skip hard page faults (kernel session)
   --no-gpu                skip DxgKrnl GPU scheduling
   --no-net                skip Kernel-Network TCP
+  --stacks                call stacks: where threads block, who woke them, and 1 kHz
+                          on-CPU samples; writes <output>.oncpu.folded / .offcpu.folded
+  --symbol-path PATH      DbgHelp search path, e.g.
+                          srv*C:\\symbols*https://msdl.microsoft.com/download/symbols
+                          (default: _NT_SYMBOL_PATH, else exported names only)
   --save-raw PATH         also write the filtered raw event stream (JSON lines)
   --replay PATH           analyse a saved raw stream instead of capturing (any OS)
 
@@ -40,6 +45,8 @@ struct Args {
     no_faults: bool,
     no_gpu: bool,
     no_net: bool,
+    stacks: bool,
+    symbol_path: Option<String>,
     save_raw: Option<String>,
     replay: Option<String>,
     output: String,
@@ -60,6 +67,8 @@ fn parse_args() -> Result<Args> {
             "--no-faults" => a.no_faults = true,
             "--no-gpu" => a.no_gpu = true,
             "--no-net" => a.no_net = true,
+            "--stacks" => a.stacks = true,
+            "--symbol-path" => a.symbol_path = Some(val("--symbol-path")?),
             "--save-raw" => a.save_raw = Some(val("--save-raw")?),
             "--replay" => a.replay = Some(val("--replay")?),
             "--output" | "-o" => a.output = val("--output")?,
@@ -120,6 +129,8 @@ fn capture(a: &Args, meta: &mut serde_json::Map<String, serde_json::Value>) -> R
         gpu: !a.no_gpu,
         net: !a.no_net,
         verbose: a.verbose,
+        stacks: a.stacks,
+        symbol_path: a.symbol_path.clone().or_else(|| std::env::var("_NT_SYMBOL_PATH").ok()),
     };
     eprintln!("capturing{} ... (Ctrl-C to stop)", a.duration.map(|d| format!(" for {:.0}s", d.as_secs_f64())).unwrap_or_default());
     let r = etw::capture(&o, stop)?;
@@ -136,6 +147,19 @@ fn capture(a: &Args, meta: &mut serde_json::Map<String, serde_json::Value>) -> R
             eprintln!("  {k} -> {v}");
         }
     }
+    if a.stacks {
+        eprintln!("stack walks: {:?}", r.stack_stats);
+    }
+    for (n, st) in [("kernel", r.kernel_stats), ("user", r.user_stats)] {
+        if let Some(st) = st {
+            if st.events_lost > 0 || st.realtime_buffers_lost > 0 {
+                eprintln!(
+                    "warning: {n} session lost {} events / {} buffers; results are incomplete",
+                    st.events_lost, st.realtime_buffers_lost
+                );
+            }
+        }
+    }
     if a.verbose {
         for (k, v) in &r.seen {
             eprintln!("  seen {k}: {v}");
@@ -148,6 +172,9 @@ fn capture(a: &Args, meta: &mut serde_json::Map<String, serde_json::Value>) -> R
     meta.insert("parse_errors".into(), json!(r.parse_errors));
     meta.insert("events_kept".into(), json!(r.kept));
     meta.insert("events_dropped".into(), json!(r.dropped));
+    meta.insert("stack_stats".into(), json!(r.stack_stats));
+    meta.insert("kernel_session_stats".into(), json!(r.kernel_stats));
+    meta.insert("user_session_stats".into(), json!(r.user_stats));
     Ok(r.events)
 }
 
@@ -180,6 +207,22 @@ fn main() -> Result<()> {
     w.flush()?;
 
     eprintln!("\n{} spans -> {}", analysis.spans.len(), a.output);
+    let stem = a.output.strip_suffix(".json").unwrap_or(&a.output).to_string();
+    for (suffix, folded, unit) in [
+        ("oncpu.folded", &analysis.folded_oncpu, "samples"),
+        ("offcpu.folded", &analysis.folded_offcpu, "us blocked"),
+    ] {
+        if folded.is_empty() {
+            continue;
+        }
+        let path = format!("{stem}.{suffix}");
+        let mut w = BufWriter::new(std::fs::File::create(&path).with_context(|| format!("create {path}"))?);
+        for (k, v) in folded {
+            writeln!(w, "{k} {v}")?;
+        }
+        w.flush()?;
+        eprintln!("{} stacks ({unit}) -> {path}  (speedscope.app or flamegraph.pl)", folded.len());
+    }
     let mut idle = 0;
     for (pid, s) in &analysis.summary {
         let active = s.on_cpu_ms > 0.0 || s.blocked_ms > 0.0 || s.gpu_packets > 0 || s.hard_faults > 0
@@ -200,8 +243,38 @@ fn main() -> Result<()> {
             eprintln!("         blocked on: {}", t.join(", "));
         }
     }
+    print_top(&analysis);
     if idle > 0 {
         eprintln!("  (+{idle} target processes with no recorded activity; -v to list)");
     }
     Ok(())
+}
+
+/// Top leaf frames by on-CPU samples and top blocking stacks, per process.
+fn print_top(a: &spans::Analysis) {
+    use std::collections::BTreeMap;
+    if !a.folded_oncpu.is_empty() {
+        let mut leaf: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for (k, v) in &a.folded_oncpu {
+            let parts: Vec<&str> = k.split(';').collect();
+            *leaf.entry((parts[0].to_string(), parts.last().unwrap_or(&"?").to_string())).or_default() += v;
+        }
+        let mut v: Vec<_> = leaf.into_iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        eprintln!("\non-CPU hot frames (samples, ~1 ms each):");
+        for ((p, f), n) in v.iter().take(12) {
+            eprintln!("  {n:>6}  {p}  {f}");
+        }
+    }
+    if !a.folded_offcpu.is_empty() {
+        let mut v: Vec<_> = a.folded_offcpu.iter().collect();
+        v.sort_by(|x, y| y.1.cmp(x.1));
+        eprintln!("\ntop blocking stacks (ms blocked; leaf-most 4 frames):");
+        for (k, us) in v.iter().take(8) {
+            let parts: Vec<&str> = k.split(';').collect();
+            let n = parts.len();
+            let tail = parts[n.saturating_sub(5)..].join(" <- ");
+            eprintln!("  {:>9.1}  {} {}  {}", **us as f64 / 1000.0, parts[0], parts.get(1).unwrap_or(&""), tail);
+        }
+    }
 }
