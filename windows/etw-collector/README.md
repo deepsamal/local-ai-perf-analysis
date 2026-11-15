@@ -36,7 +36,7 @@ the start-up snapshot.
 
 ## Stacks (`--stacks`, Administrator)
 
-`--stacks` turns on kernel stack walking for three event types, and adds a
+`--stacks` (= `--stacks=full`) turns on kernel stack walking for three event types, and adds a
 module rundown and DbgHelp symbolisation at the end of the capture:
 
 | Event | Stack shows | Where it lands |
@@ -70,9 +70,16 @@ Symbols resolve as far as the binaries allow:
 * `etw-collector --symbol-selftest` (no admin needed) reports which
   dbghelp is in use and whether PDB download works.
 
-Stack walking happens system-wide on every context switch. That is the same
-cost WPR pays, but keep captures short (≤ 30 s). The summary warns if the
-session lost events.
+**Overhead.** ETW walks each stack inside the thread that triggered the
+event. The user-mode half is walked by an APC when the thread returns to
+user mode. So the traced program pays for it, and samples land in
+`EtwpStackWalkApc` / `RtlWalkFrameChain`. Those frames are folded into a
+single `[ETW stack walk]` leaf, and the summary prints the share for each
+process. In the Ollama capture this was ~6% for llama-server and ~30% for
+Go's `ollama.exe`, which switches threads constantly. `--stacks=sample`
+walks stacks only for the 1 kHz CPU samples: no blocking stacks or wakers,
+but much less overhead. Keep full captures short (≤ 30 s); the summary warns
+if events were lost.
 
 ## Usage
 

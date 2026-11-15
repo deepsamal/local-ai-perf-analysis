@@ -69,17 +69,18 @@ pub fn session_stats(session: &str) -> Option<SessionStats> {
 
 /// Ask the kernel logger to attach a call stack to CSwitch, ReadyThread and
 /// SampledProfile events (what WPR's CSwitch/ReadyThread/Profile stacks do).
-pub fn enable_stack_tracing(session: &str) -> Result<(), String> {
+pub fn enable_stack_tracing(session: &str, switches: bool) -> Result<(), String> {
     let mut p = query(session).map_err(|e| format!("ControlTrace(QUERY) error {e}"))?;
     let handle = unsafe { (*p.ptr()).Wnode.Anonymous1.HistoricalContext };
     let id = |g: GUID, t: u8| CLASSIC_EVENT_ID { EventGuid: g, Type: t, Reserved: [0; 7] };
-    let ids = [id(THREAD_GUID, 36), id(THREAD_GUID, 50), id(PERFINFO_GUID, 46)];
+    let all = [id(PERFINFO_GUID, 46), id(THREAD_GUID, 36), id(THREAD_GUID, 50)];
+    let ids = if switches { &all[..] } else { &all[..1] };
     let rc = unsafe {
         TraceSetInformation(
             CONTROLTRACE_HANDLE { Value: handle },
             TraceStackTracingInfo,
             ids.as_ptr() as *const _,
-            std::mem::size_of_val(&ids) as u32,
+            std::mem::size_of_val(ids) as u32,
         )
     };
     if rc != 0 {

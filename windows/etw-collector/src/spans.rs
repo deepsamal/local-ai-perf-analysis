@@ -64,6 +64,8 @@ pub struct ProcSummary {
     pub tcp_recv_bytes: u64,
     pub threads: usize,
     pub cpu_samples: u64,
+    /// Samples inside ETW's own stack walking (observer overhead of --stacks).
+    pub tracing_overhead_samples: u64,
     pub blocked_spans_with_stack: u64,
 }
 
@@ -230,10 +232,13 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
                 if let Some(&pid) = a.thread_pid.get(tid) {
                     if targets.contains(&pid) {
                         summ!(pid).cpu_samples += 1;
-                        let frames = stacks
+                        let mut frames = stacks
                             .get(*ts, *tid, StackOn::Sample)
                             .map(|f| syms.frames(pid, f))
                             .unwrap_or_else(|| vec!["[no stack]".into()]);
+                        if collapse_etw_overhead(&mut frames) {
+                            summ!(pid).tracing_overhead_samples += 1;
+                        }
                         let k = folded_key(&proc_label(&a.proc_names, pid), &thread_label(pid, *tid), &frames, None);
                         *a.folded_oncpu.entry(k).or_default() += 1;
                     }
@@ -469,6 +474,24 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
     a
 }
 
+/// ETW captures stacks by walking them inside the traced thread (the user
+/// half via an APC on return to user mode), so samples land in that code.
+/// Replace everything leafward of the outermost such frame with one marker.
+pub fn collapse_etw_overhead(leaf_first: &mut Vec<String>) -> bool {
+    let is_etw = |f: &str| {
+        let func = f.split_once('!').map_or(f, |(_, n)| n);
+        func.starts_with("Etwp") || func.starts_with("EtwTrace") || func == "KiDeliverApc"
+    };
+    match leaf_first.iter().rposition(|f| is_etw(f)) {
+        Some(i) => {
+            leaf_first.drain(..=i);
+            leaf_first.insert(0, "[ETW stack walk]".into());
+            true
+        }
+        None => false,
+    }
+}
+
 /// Synthetic track ids so GPU contexts and network show as their own rows
 /// under the owning process (real Windows TIDs are multiples of 4 and far
 /// below these).
@@ -650,5 +673,16 @@ mod tests {
             "ollama.exe (100);ggml.dll!worker (1000);ggml.dll!worker;ggml.dll!compute"
         );
         assert_eq!(a.folded_offcpu.values().next(), Some(&30)); // 300 ticks = 30 us
+    }
+
+    #[test]
+    fn etw_overhead_is_collapsed() {
+        let mut f: Vec<String> = ["ntoskrnl.exe!RtlpUnwindPrologue", "ntoskrnl.exe!EtwpTraceStackWalk", "ntoskrnl.exe!EtwpStackWalkApc",
+            "ntoskrnl.exe!KiDeliverApc", "ntoskrnl.exe!KiCheckForKernelApcDelivery", "dxgkrnl.sys!DxgkSubmitCommand", "app!main"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(collapse_etw_overhead(&mut f));
+        assert_eq!(f, vec!["[ETW stack walk]", "ntoskrnl.exe!KiCheckForKernelApcDelivery", "dxgkrnl.sys!DxgkSubmitCommand", "app!main"]);
+        let mut g = vec!["app!work".to_string()];
+        assert!(!collapse_etw_overhead(&mut g));
     }
 }

@@ -48,8 +48,25 @@ pub struct Options {
     pub verbose: bool,
     /// Stack walks on CSwitch/ReadyThread + 1 kHz SampledProfile, module
     /// rundown and DbgHelp symbolisation (kernel session, Administrator).
-    pub stacks: bool,
+    pub stacks: StackMode,
     pub symbol_path: Option<String>,
+}
+
+/// Which events get a kernel stack walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackMode {
+    Off,
+    /// Only the 1 kHz on-CPU samples: low overhead.
+    Sample,
+    /// Samples + every context switch and wakeup of every thread on the
+    /// box (blocking stacks, wakers): 5-30% overhead in switch-heavy targets.
+    Full,
+}
+
+impl StackMode {
+    pub fn on(self) -> bool {
+        self != StackMode::Off
+    }
 }
 
 #[derive(Default)]
@@ -400,7 +417,7 @@ const KERNEL_SESSION: &str = "lapa-etw-kernel";
 
 fn start_kernel(sh: &Sh, o: &Options) -> Result<KernelTrace> {
     let mut b = KernelTrace::new().named(KERNEL_SESSION.to_string());
-    if o.stacks {
+    if o.stacks.on() {
         // Stack walks on every context switch are bulky: bigger buffers.
         b = b.set_trace_properties(ferrisetw::trace::TraceProperties {
             buffer_size: 1024,
@@ -421,7 +438,7 @@ fn start_kernel(sh: &Sh, o: &Options) -> Result<KernelTrace> {
     if o.faults {
         b = b.enable(Provider::kernel(&MEMORY_HARD_FAULT_PROVIDER).add_callback(kernel_fault_cb(sh.clone())).build());
     }
-    if o.stacks {
+    if o.stacks.on() {
         b = b.enable(Provider::kernel(&IMAGE_LOAD_PROVIDER).add_callback(kernel_image_cb(sh.clone())).build());
         if o.cpu {
             b = b.enable(Provider::kernel(&PROFILE_PROVIDER).add_callback(kernel_profile_cb(sh.clone())).build());
@@ -683,8 +700,8 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
     let (admin, perflog) = token_groups();
     notes.push(format!("token: elevated administrator = {admin}, Performance Log Users = {perflog}"));
 
-    let need_kernel = o.cpu || o.faults || o.stacks;
-    if o.stacks {
+    let need_kernel = o.cpu || o.faults || o.stacks.on();
+    if o.stacks.on() {
         sh.lock().unwrap().path_map = Some(winsys::PathMap::new());
         if o.cpu {
             if let Err(e) = winsys::enable_profile_privilege() {
@@ -695,9 +712,12 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
     let kernel = if need_kernel {
         match start_kernel(&sh, o) {
             Ok(t) => {
-                if o.stacks {
-                    match winsys::enable_stack_tracing(KERNEL_SESSION) {
-                        Ok(()) => notes.push("stack walking enabled on CSwitch, ReadyThread, SampledProfile".into()),
+                if o.stacks.on() {
+                    match winsys::enable_stack_tracing(KERNEL_SESSION, o.stacks == StackMode::Full) {
+                        Ok(()) => notes.push(format!(
+                            "stack walking enabled on {}",
+                            if o.stacks == StackMode::Full { "CSwitch, ReadyThread, SampledProfile" } else { "SampledProfile only" }
+                        )),
                         Err(e) => notes.push(format!("stack walking unavailable: {e}")),
                     }
                 }
@@ -756,7 +776,7 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
 
     let mut s = sh.lock().unwrap();
     let mut events = std::mem::take(&mut s.events);
-    if o.stacks {
+    if o.stacks.on() {
         let t = Instant::now();
         let mut thread_pid = HashMap::new();
         for r in &events {

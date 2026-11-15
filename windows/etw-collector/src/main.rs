@@ -22,8 +22,10 @@ CAPTURE:
   --no-faults             skip hard page faults (kernel session)
   --no-gpu                skip DxgKrnl GPU scheduling
   --no-net                skip Kernel-Network TCP
-  --stacks                call stacks: where threads block, who woke them, and 1 kHz
-                          on-CPU samples; writes <output>.oncpu.folded / .offcpu.folded
+  --stacks[=full]         call stacks: 1 kHz on-CPU samples + where threads block and
+                          who woke them; writes <output>.oncpu.folded / .offcpu.folded.
+                          Walks a stack on every context switch: 5-30% overhead.
+  --stacks=sample         on-CPU sample stacks only (low overhead)
   --symbol-path PATH      DbgHelp search path, e.g.
                           srv*C:\\symbols*https://msdl.microsoft.com/download/symbols
                           (default: _NT_SYMBOL_PATH, else Microsoft's server when the
@@ -48,7 +50,7 @@ struct Args {
     no_faults: bool,
     no_gpu: bool,
     no_net: bool,
-    stacks: bool,
+    stacks: Option<String>,
     symbol_path: Option<String>,
     symbol_selftest: bool,
     save_raw: Option<String>,
@@ -71,7 +73,14 @@ fn parse_args() -> Result<Args> {
             "--no-faults" => a.no_faults = true,
             "--no-gpu" => a.no_gpu = true,
             "--no-net" => a.no_net = true,
-            "--stacks" => a.stacks = true,
+            "--stacks" => a.stacks = Some("full".into()),
+            x if x.starts_with("--stacks=") => {
+                let m = &x["--stacks=".len()..];
+                if m != "full" && m != "sample" {
+                    bail!("--stacks= takes 'sample' or 'full'");
+                }
+                a.stacks = Some(m.to_string());
+            }
             "--symbol-path" => a.symbol_path = Some(val("--symbol-path")?),
             "--symbol-selftest" => a.symbol_selftest = true,
             "--save-raw" => a.save_raw = Some(val("--save-raw")?),
@@ -134,7 +143,11 @@ fn capture(a: &Args, meta: &mut serde_json::Map<String, serde_json::Value>) -> R
         gpu: !a.no_gpu,
         net: !a.no_net,
         verbose: a.verbose,
-        stacks: a.stacks,
+        stacks: match a.stacks.as_deref() {
+            None => etw::StackMode::Off,
+            Some("sample") => etw::StackMode::Sample,
+            Some(_) => etw::StackMode::Full,
+        },
         symbol_path: a.symbol_path.clone().or_else(|| std::env::var("_NT_SYMBOL_PATH").ok()),
     };
     eprintln!("capturing{} ... (Ctrl-C to stop)", a.duration.map(|d| format!(" for {:.0}s", d.as_secs_f64())).unwrap_or_default());
@@ -152,7 +165,7 @@ fn capture(a: &Args, meta: &mut serde_json::Map<String, serde_json::Value>) -> R
             eprintln!("  {k} -> {v}");
         }
     }
-    if a.stacks {
+    if a.stacks.is_some() {
         eprintln!("stack walks: {:?}", r.stack_stats);
     }
     for (n, st) in [("kernel", r.kernel_stats), ("user", r.user_stats)] {
@@ -255,6 +268,12 @@ fn main() -> Result<()> {
             s.name, s.on_cpu_ms, s.blocked_ms, s.runnable_ms, s.gpu_busy_ms, s.gpu_packets,
             if s.gpu_source.is_empty() { "-" } else { &s.gpu_source }, s.hard_faults, s.tcp_sent_bytes, s.tcp_recv_bytes
         );
+        if s.cpu_samples > 0 && s.tracing_overhead_samples > 0 {
+            eprintln!(
+                "         {:.1}% of on-CPU samples were ETW stack walking (observer overhead; shown as [ETW stack walk])",
+                100.0 * s.tracing_overhead_samples as f64 / s.cpu_samples as f64
+            );
+        }
         let mut top: Vec<_> = s.blocked_by_reason_ms.iter().collect();
         top.sort_by(|x, y| y.1.partial_cmp(x.1).unwrap());
         if !top.is_empty() {
