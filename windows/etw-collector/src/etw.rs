@@ -765,15 +765,30 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
             }
         }
         let wanted = crate::stacks::Symbols::wanted(&events, &thread_pid);
-        let (syms, st) = winsys::symbolize(&events, &wanted, o.symbol_path.as_deref());
-        notes.push(format!(
-            "symbolised {} addresses in {:.1}s: {:?}{}",
-            wanted.len(),
-            t.elapsed().as_secs_f64(),
-            st,
-            if o.symbol_path.is_none() { " (exports only; pass --symbol-path for PDB symbols)" } else { "" }
-        ));
-        events.extend(syms);
+        match winsys::DbgHelp::load() {
+            Ok(dh) => {
+                let path = o.symbol_path.clone().or_else(|| dh.default_symbol_path());
+                let r = winsys::symbolize(&dh, &events, &wanted, path.as_deref());
+                notes.push(format!(
+                    "symbolised {} addresses in {:.1}s with {} (symsrv: {}; path: {}): {:?}",
+                    wanted.len(),
+                    t.elapsed().as_secs_f64(),
+                    dh.path,
+                    dh.has_symsrv,
+                    path.as_deref().unwrap_or("none, exports only"),
+                    r.stats
+                ));
+                let mut by_type: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+                for (m, ty) in &r.modules {
+                    by_type.entry(ty).or_default().push(m);
+                }
+                for (ty, ms) in by_type {
+                    notes.push(format!("  symbols={ty}: {}", ms.join(", ")));
+                }
+                events.extend(r.syms);
+            }
+            Err(e) => notes.push(format!("no symbolisation: {e}")),
+        }
     }
     Ok(CaptureResult {
         events,

@@ -51,15 +51,24 @@ tid. Open the `.folded` files in speedscope.app or flamegraph.pl.
 
 Symbols resolve as far as the binaries allow:
 
-* With no `--symbol-path` (and no `_NT_SYMBOL_PATH`), you get export names.
-  A frame more than 256 KB past the nearest export shows as
-  `module+0xoffset` rather than under a misleading name.
-* `--symbol-path "srv*C:\symbols*https://msdl.microsoft.com/download/symbols"`
-  gives full names for Windows components. This also needs `symsrv.dll`
-  next to the `dbghelp.dll` in use; both come with the Windows SDK
-  Debugging Tools.
+* DbgHelp is loaded at run time and prefers the Windows SDK Debugging
+  Tools copy (`Windows Kits\10\Debuggers\x64`), which can download PDBs
+  through `symsrv.dll`. Override it with `ETW_COLLECTOR_DBGHELP`.
+* With those tools installed and no `--symbol-path`/`_NT_SYMBOL_PATH`,
+  Microsoft's server is used, with a cache in
+  `%LOCALAPPDATA%\etw-collector\symbols`. The first run downloads PDBs
+  for ntoskrnl, ntdll and the others; later runs are fast. Without the
+  tools, you get export names only.
+* Export-only modules are typical of third-party DLLs (NVIDIA, ggml). There
+  a frame more than 16 KB past the nearest export shows as `module+0xoffset`
+  rather than under a misleading name. Itanium C++ names from clang/MinGW
+  builds are demangled.
 * Go binaries (`ollama.exe`) carry no PDB, so their frames stay
   `ollama.exe+0x...` until a Go symbol-table reader is added.
+* The summary lists the symbol type DbgHelp got for each module
+  (`symbols=pdb: ...`, `symbols=exports: ...`).
+* `etw-collector --symbol-selftest` (no admin needed) reports which
+  dbghelp is in use and whether PDB download works.
 
 Stack walking happens system-wide on every context switch. That is the same
 cost WPR pays, but keep captures short (≤ 30 s). The summary warns if the

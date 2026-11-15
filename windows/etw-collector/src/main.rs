@@ -26,7 +26,10 @@ CAPTURE:
                           on-CPU samples; writes <output>.oncpu.folded / .offcpu.folded
   --symbol-path PATH      DbgHelp search path, e.g.
                           srv*C:\\symbols*https://msdl.microsoft.com/download/symbols
-                          (default: _NT_SYMBOL_PATH, else exported names only)
+                          (default: _NT_SYMBOL_PATH, else Microsoft's server when the
+                          Debugging Tools' dbghelp+symsrv are installed, else exports)
+  --symbol-selftest       resolve ntdll/kernel32 functions in this process and report
+                          which dbghelp is used and whether PDB download works (no admin)
   --save-raw PATH         also write the filtered raw event stream (JSON lines)
   --replay PATH           analyse a saved raw stream instead of capturing (any OS)
 
@@ -47,6 +50,7 @@ struct Args {
     no_net: bool,
     stacks: bool,
     symbol_path: Option<String>,
+    symbol_selftest: bool,
     save_raw: Option<String>,
     replay: Option<String>,
     output: String,
@@ -69,6 +73,7 @@ fn parse_args() -> Result<Args> {
             "--no-net" => a.no_net = true,
             "--stacks" => a.stacks = true,
             "--symbol-path" => a.symbol_path = Some(val("--symbol-path")?),
+            "--symbol-selftest" => a.symbol_selftest = true,
             "--save-raw" => a.save_raw = Some(val("--save-raw")?),
             "--replay" => a.replay = Some(val("--replay")?),
             "--output" | "-o" => a.output = val("--output")?,
@@ -83,7 +88,7 @@ fn parse_args() -> Result<Args> {
     if a.replay.is_none() {
         a.target.exclude_pid = Some(std::process::id());
     }
-    if a.target.pids.is_empty() && a.target.names.is_empty() {
+    if a.target.pids.is_empty() && a.target.names.is_empty() && !a.symbol_selftest {
         bail!("specify at least one --pid or --process-name\n\n{USAGE}");
     }
     Ok(a)
@@ -185,6 +190,20 @@ fn capture(_: &Args, _: &mut serde_json::Map<String, serde_json::Value>) -> Resu
 
 fn main() -> Result<()> {
     let a = parse_args()?;
+    if a.symbol_selftest {
+        #[cfg(windows)]
+        {
+            let p = a.symbol_path.clone().or_else(|| std::env::var("_NT_SYMBOL_PATH").ok());
+            match etw_collector::winsys::symbol_selftest(p.as_deref()) {
+                Ok(s) => println!("{s}"),
+                Err(e) => bail!("symbol self-test failed: {e}"),
+            }
+        }
+        #[cfg(not(windows))]
+        bail!("--symbol-selftest needs Windows");
+        #[allow(unreachable_code)]
+        return Ok(());
+    }
     let mut meta = serde_json::Map::new();
     let raw = match &a.replay {
         Some(p) => {
