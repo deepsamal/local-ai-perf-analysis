@@ -64,13 +64,18 @@ pub struct Shared {
     pub stack_owner: HashMap<u32, (i64, Owner)>,
     pub stack_stats: BTreeMap<String, u64>,
     pub path_map: Option<winsys::PathMap>,
+    /// Per CPU: index of a kept ReadyThread whose stack walk (logged next on
+    /// the same CPU, in the waker's context) has not arrived yet.
+    pub cpu_ready: HashMap<u16, usize>,
+    /// Kernel-only stacks awaiting their user-mode half, keyed by
+    /// (stack thread, EventTimeStamp of the original event).
+    pub partial: HashMap<(u32, u64), (i64, StackOn)>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum Owner {
     CSwitchNew,
     CSwitchOld,
-    Ready,
     Sample,
 }
 
@@ -99,9 +104,17 @@ fn push(sh: &Sh, r: Raw) {
     }
 }
 
+fn cpu_of(rec: &EventRecord) -> u16 {
+    // SAFETY: ferrisetw's EventRecord is #[repr(transparent)] over EVENT_RECORD.
+    let er = unsafe { &*(rec as *const EventRecord as *const windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD) };
+    unsafe { er.BufferContext.Anonymous.ProcessorIndex }
+}
+
 /// Push an event; if kept, remember which threads' next stack walk belongs to it.
-fn push_owned(sh: &Sh, r: Raw, owners: &[(u32, Owner)]) {
+fn push_owned(sh: &Sh, r: Raw, owners: &[(u32, Owner)], cpu: u16) {
     if let Ok(mut s) = sh.lock() {
+        // Any stack-carrying event on this CPU supersedes a pending Ready.
+        s.cpu_ready.remove(&cpu);
         if s.filter.observe(&r) {
             let ts = r.ts();
             s.events.push(r);
@@ -222,17 +235,26 @@ fn kernel_thread_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send +
                         &sh,
                         Raw::CSwitch { ts, new_tid, old_tid, old_state, wait_reason },
                         &[(old_tid, Owner::CSwitchOld), (new_tid, Owner::CSwitchNew)],
+                        cpu_of(rec),
                     );
                 }
             }
             50 => {
                 if let Some(tid) = p.u32("TThreadId") {
-                    // Logged in the context of the thread doing the waking.
-                    let (mut waker_pid, mut waker_tid) = (rec.process_id(), rec.thread_id());
-                    if waker_tid == u32::MAX {
-                        (waker_pid, waker_tid) = (0, 0);
+                    // The kernel logger leaves the header thread id at -1 here;
+                    // the waker is filled in from the stack walk that follows
+                    // on the same CPU (it runs in the waker's context).
+                    let cpu = cpu_of(rec);
+                    if let Ok(mut s) = sh.lock() {
+                        let r = Raw::Ready { ts, tid, waker_pid: 0, waker_tid: 0 };
+                        if s.filter.observe(&r) {
+                            let idx = s.events.len();
+                            s.events.push(r);
+                            s.cpu_ready.insert(cpu, idx);
+                        } else {
+                            s.cpu_ready.remove(&cpu);
+                        }
                     }
-                    push_owned(&sh, Raw::Ready { ts, tid, waker_pid, waker_tid }, &[(waker_tid, Owner::Ready)]);
                 }
             }
             _ => {}
@@ -276,7 +298,7 @@ fn kernel_profile_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send 
         let Some((schema, tag)) = parser!(&sh, rec, loc, "PerfInfo/op46".to_string()) else { return };
         let p = P { p: Parser::create(rec, &schema), sh: &sh, tag: &tag };
         if let Some(tid) = p.u32("ThreadId") {
-            push_owned(&sh, Raw::Sample { ts: rec.raw_timestamp(), tid }, &[(tid, Owner::Sample)]);
+            push_owned(&sh, Raw::Sample { ts: rec.raw_timestamp(), tid }, &[(tid, Owner::Sample)], cpu_of(rec));
         }
     }
 }
@@ -317,17 +339,41 @@ fn kernel_stack_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + 
         }
         let data = unsafe { std::slice::from_raw_parts(er.UserData as *const u8, er.UserDataLength as usize) };
         let ptr = if rec.event_flags() & 0x0020 != 0 { 4 } else { 8 }; // EVENT_HEADER_FLAG_32_BIT_HEADER
+        // The kernel half of a stack is logged at once; the user half is
+        // logged when the thread next returns to user mode, as a separate
+        // event carrying the same EventTimeStamp.
+        let qpc = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let pid = u32::from_le_bytes(data[8..12].try_into().unwrap());
         let tid = u32::from_le_bytes(data[12..16].try_into().unwrap());
+        let cpu = cpu_of(rec);
         let frames: Vec<u64> = data[16..]
             .chunks_exact(ptr)
             .map(|c| if ptr == 8 { u64::from_le_bytes(c.try_into().unwrap()) } else { u32::from_le_bytes(c.try_into().unwrap()) as u64 })
             .collect();
+        let kernel_only = !frames.is_empty() && frames.iter().all(|&a| a >= crate::model::KERNEL_ADDR_MIN);
         if let Ok(mut s) = sh.lock() {
+            if let Some((ts, on)) = s.partial.remove(&(tid, qpc)) {
+                *s.stack_stats.entry("user_half_joined".into()).or_default() += 1;
+                s.events.push(Raw::Stack { ts, tid, on, frames });
+                return;
+            }
+            if let Some(idx) = s.cpu_ready.remove(&cpu) {
+                if let Some(Raw::Ready { ts, waker_pid, waker_tid, .. }) = s.events.get_mut(idx) {
+                    *waker_pid = pid;
+                    *waker_tid = tid;
+                    let ts = *ts;
+                    *s.stack_stats.entry("matched_Ready".into()).or_default() += 1;
+                    if kernel_only {
+                        s.partial.insert((tid, qpc), (ts, StackOn::Ready));
+                    }
+                    s.events.push(Raw::Stack { ts, tid, on: StackOn::Ready, frames });
+                    return;
+                }
+            }
             match s.stack_owner.remove(&tid) {
                 Some((ts, o)) => {
                     let on = match o {
                         Owner::CSwitchNew | Owner::CSwitchOld => StackOn::CSwitch,
-                        Owner::Ready => StackOn::Ready,
                         Owner::Sample => StackOn::Sample,
                     };
                     // A CSwitch registers both threads; drop the sibling entry
@@ -339,6 +385,9 @@ fn kernel_stack_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + 
                         }
                     }
                     *s.stack_stats.entry(format!("matched_{o:?}")).or_default() += 1;
+                    if kernel_only {
+                        s.partial.insert((tid, qpc), (ts, on));
+                    }
                     s.events.push(Raw::Stack { ts, tid, on, frames });
                 }
                 None => *s.stack_stats.entry("unmatched".into()).or_default() += 1,

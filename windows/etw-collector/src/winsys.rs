@@ -219,7 +219,7 @@ pub fn symbolize(raw: &[Raw], wanted: &[(u32, u64)], symbol_path: Option<&str>) 
             };
             // With export-only symbols the "nearest" export can be far away;
             // a module+offset is more honest than a misleading name.
-            if found && disp > 0x4_0000 {
+            if found && disp > crate::stacks::MAX_EXPORT_DISP {
                 *stats.entry("too_far_from_export".into()).or_default() += 1;
                 continue;
             }
@@ -232,10 +232,10 @@ pub fn symbolize(raw: &[Raw], wanted: &[(u32, u64)], symbol_path: Option<&str>) 
                 let p = std::ptr::addr_of!((*si).Name) as *const u16;
                 String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
             };
-            let modbase = unsafe { (*si).ModBase };
+            // ModBase is not filled in for export-table symbols: use our map.
             let module = mods
                 .iter()
-                .find(|(b, _, _)| *b == modbase)
+                .find(|(b, sz, _)| a >= *b && a < b.saturating_add(*sz))
                 .map(|(_, _, p)| module_name(p))
                 .unwrap_or_else(|| "?".into());
             let full = if disp == 0 { format!("{module}!{name}") } else { format!("{module}!{name}+0x{disp:x}") };

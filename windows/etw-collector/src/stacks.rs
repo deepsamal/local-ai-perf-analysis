@@ -17,8 +17,10 @@ impl StackIndex {
     pub fn build(raw: &[Raw]) -> Self {
         let mut map = HashMap::new();
         for r in raw {
+            // A second Stack for the same key is the deferred user-mode half:
+            // it continues the kernel half toward the root.
             if let Raw::Stack { ts, tid, on, frames } = r {
-                map.insert((*ts, *tid, *on), frames.clone());
+                map.entry((*ts, *tid, *on)).or_insert_with(Vec::new).extend_from_slice(frames);
             }
         }
         StackIndex { map }
@@ -48,6 +50,32 @@ struct Module {
 pub struct Symbols {
     names: HashMap<(u32, u64), String>,
     modules: HashMap<u32, Vec<Module>>, // sorted by base
+}
+
+/// Beyond this a name is a guess from the nearest export, not a function.
+pub const MAX_EXPORT_DISP: u64 = 0x4000;
+
+/// Demangle Itanium C++ names; DbgHelp's export table drops the leading `_`.
+pub fn demangle(f: &str) -> String {
+    let m = if f.starts_with("_Z") { f.to_string() } else if f.starts_with('Z') && f.len() > 2 { format!("_{f}") } else { return f.to_string() };
+    match cpp_demangle::Symbol::new(m.as_bytes()) {
+        Ok(sym) => {
+            let opts = cpp_demangle::DemangleOptions::new().no_params().no_return_type();
+            sym.demangle(&opts).unwrap_or_else(|_| f.to_string())
+        }
+        Err(_) => f.to_string(),
+    }
+}
+
+/// Drop kernel-mode frames when user-mode frames exist: for a blocked
+/// thread they are the same KeWaitFor*/KiSwapContext boilerplate every time.
+pub fn user_frames(leaf_first: &[u64]) -> Vec<u64> {
+    let u: Vec<u64> = leaf_first.iter().copied().filter(|&a| a < KERNEL_ADDR_MIN).collect();
+    if u.is_empty() {
+        leaf_first.to_vec()
+    } else {
+        u
+    }
 }
 
 pub fn module_name(path: &str) -> String {
@@ -97,12 +125,31 @@ impl Symbols {
     pub fn resolve(&self, pid: u32, addr: u64) -> String {
         let sp = Self::space(pid, addr);
         if let Some(n) = self.names.get(&(sp, addr)) {
-            return n.clone();
+            if let Some(fixed) = self.clean(sp, addr, n) {
+                return fixed;
+            }
         }
         match self.module(sp, addr) {
             Some(m) => format!("{}+0x{:x}", m.name, addr - m.base),
             None => format!("0x{addr:x}"),
         }
+    }
+
+    /// Normalise a DbgHelp name: fill in an unknown module (`?!`), drop
+    /// names whose displacement shows they are only the nearest export
+    /// (a real function body is rarely > 16 KB from its start), and demangle
+    /// Itanium C++ names (clang/MinGW builds such as llama.cpp).
+    fn clean(&self, sp: u32, addr: u64, n: &str) -> Option<String> {
+        let (module, rest) = n.split_once('!')?;
+        let module = if module == "?" { self.module(sp, addr).map(|m| m.name.clone())? } else { module.to_string() };
+        let (func, disp) = match rest.rsplit_once("+0x") {
+            Some((f, d)) => (f, u64::from_str_radix(d, 16).ok()?),
+            None => (rest, 0),
+        };
+        if disp > MAX_EXPORT_DISP {
+            return None;
+        }
+        Some(format!("{module}!{}", demangle(func)))
     }
 
     /// Leaf-first frames -> names (leaf first).
@@ -154,11 +201,38 @@ mod tests {
             Raw::Sym { pid: 7, addr: 0x1010, name: "ggml-cuda.dll!launch+0x10".into() },
         ];
         let s = Symbols::build(&raw);
-        assert_eq!(s.resolve(7, 0x1010), "ggml-cuda.dll!launch+0x10");
+        assert_eq!(s.resolve(7, 0x1010), "ggml-cuda.dll!launch"); // offsets dropped: flame graphs aggregate per function
         assert_eq!(s.resolve(7, 0x1abc), "ggml-cuda.dll+0xabc");
         assert_eq!(s.resolve(7, 0x5000), "0x5000");
         assert_eq!(s.resolve(7, KERNEL_ADDR_MIN + 0x10020), "ntoskrnl.exe+0x20");
         assert_eq!(s.resolve(9, 0x1010), "0x1010"); // other process: different map
+    }
+
+    #[test]
+    fn cleans_unknown_module_far_exports_and_mangling() {
+        let raw = vec![
+            Raw::Image { ts: 0, pid: 7, base: 0x10000, size: 0x100000, path: "C:\\x\\llama.dll".into() },
+            Raw::Sym { pid: 7, addr: 0x10100, name: "?!ZN13llama_context6decodeERK11llama_batch+0x9fe".into() },
+            Raw::Sym { pid: 7, addr: 0x30000, name: "?!setjmpex+0x8575".into() },
+            Raw::Sym { pid: 7, addr: 0x10200, name: "llama.dll!llama_decode".into() },
+        ];
+        let s = Symbols::build(&raw);
+        assert_eq!(s.resolve(7, 0x10100), "llama.dll!llama_context::decode");
+        assert_eq!(s.resolve(7, 0x30000), "llama.dll+0x20000");
+        assert_eq!(s.resolve(7, 0x10200), "llama.dll!llama_decode");
+        assert_eq!(user_frames(&[KERNEL_ADDR_MIN + 1, 5, 6]), vec![5, 6]);
+        assert_eq!(user_frames(&[KERNEL_ADDR_MIN + 1]), vec![KERNEL_ADDR_MIN + 1]);
+    }
+
+    #[test]
+    fn user_half_continues_kernel_half() {
+        let k = KERNEL_ADDR_MIN + 5;
+        let raw = vec![
+            Raw::Stack { ts: 1, tid: 2, on: StackOn::CSwitch, frames: vec![k, k + 1] },
+            Raw::Stack { ts: 1, tid: 2, on: StackOn::CSwitch, frames: vec![0x10, 0x20] },
+        ];
+        let idx = StackIndex::build(&raw);
+        assert_eq!(idx.get(1, 2, StackOn::CSwitch).unwrap(), &vec![k, k + 1, 0x10, 0x20]);
     }
 
     #[test]

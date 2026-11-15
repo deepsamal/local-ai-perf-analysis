@@ -17,7 +17,7 @@
 //! Wait/Signal packets are synchronisation, not work, and are skipped.
 
 use crate::model::*;
-use crate::stacks::{folded_key, module_name, StackIndex, Symbols};
+use crate::stacks::{folded_key, module_name, user_frames, StackIndex, Symbols};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
@@ -289,12 +289,12 @@ pub fn analyze(mut raw: Vec<Raw>, target: &Target) -> Analysis {
                                 let stack = stacks
                                     .get(ts, *new_tid, StackOn::CSwitch)
                                     .or_else(|| stacks.get(off, *new_tid, StackOn::CSwitch))
-                                    .map(|f| syms.frames(pid, f));
+                                    .map(|f| syms.frames(pid, &user_frames(f)));
                                 if let Some((wpid, wtid, wts)) = st.waker {
                                     let wname = a.proc_names.get(&wpid).map(|n| module_name(n)).unwrap_or_default();
                                     args["woken_by"] = serde_json::json!(format!("{wname} pid {wpid} tid {wtid}"));
                                     if let Some(f) = stacks.get(wts, wtid, StackOn::Ready) {
-                                        args["waker_stack"] = serde_json::json!(syms.frames(wpid, f));
+                                        args["waker_stack"] = serde_json::json!(syms.frames(wpid, &user_frames(f)));
                                     }
                                 }
                                 if let Some(f) = &stack {
