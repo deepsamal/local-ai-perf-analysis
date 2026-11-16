@@ -23,6 +23,10 @@ pub fn to_json(a: &Analysis, meta: Value) -> Value {
             "Network (TCP)".to_string()
         } else if *tid & 0xFFFF_0000 == gpu_track(0) & 0xFFFF_0000 {
             format!("GPU context #{:04x}", tid & 0xFFFF)
+        } else if *tid & 0xFFFF_0000 == crate::nsight::CUDA_KERNEL_TRACK {
+            if *tid & 0xFFFF == 0xFFFF { "CUDA memcpy".to_string() } else { format!("CUDA stream {}", tid & 0xFFFF) }
+        } else if *tid & 0xFFFF_0000 == crate::nsight::CUDA_API_TRACK {
+            format!("CUDA API (tid {})", tid & 0xFFFF)
         } else {
             a.thread_labels.get(&(*pid, *tid)).cloned().unwrap_or_else(|| format!("thread {tid}"))
         };

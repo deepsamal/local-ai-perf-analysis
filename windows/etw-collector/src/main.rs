@@ -34,6 +34,10 @@ CAPTURE:
                           which dbghelp is used and whether PDB download works (no admin)
   --save-raw PATH         also write the filtered raw event stream (JSON lines)
   --replay PATH           analyse a saved raw stream instead of capturing (any OS)
+  --nsys PATH.sqlite      optional: add an Nsight Systems capture (`nsys export -t sqlite`):
+                          kernel names, CUDA sync/launch timing, per-token breakdown.
+                          Merged into the timeline when it overlaps the ETW capture;
+                          summary only otherwise. Alone (no target) = Nsight-only report.
 
 OUTPUT:
   --output PATH           Chrome Trace JSON (default: etw_trace.json)
@@ -55,6 +59,7 @@ struct Args {
     symbol_selftest: bool,
     save_raw: Option<String>,
     replay: Option<String>,
+    nsys: Option<String>,
     output: String,
     verbose: bool,
 }
@@ -85,6 +90,7 @@ fn parse_args() -> Result<Args> {
             "--symbol-selftest" => a.symbol_selftest = true,
             "--save-raw" => a.save_raw = Some(val("--save-raw")?),
             "--replay" => a.replay = Some(val("--replay")?),
+            "--nsys" => a.nsys = Some(val("--nsys")?),
             "--output" | "-o" => a.output = val("--output")?,
             "-v" | "--verbose" => a.verbose = true,
             "-h" | "--help" => {
@@ -97,7 +103,7 @@ fn parse_args() -> Result<Args> {
     if a.replay.is_none() {
         a.target.exclude_pid = Some(std::process::id());
     }
-    if a.target.pids.is_empty() && a.target.names.is_empty() && !a.symbol_selftest {
+    if a.target.pids.is_empty() && a.target.names.is_empty() && !a.symbol_selftest && a.nsys.is_none() {
         bail!("specify at least one --pid or --process-name\n\n{USAGE}");
     }
     Ok(a)
@@ -218,18 +224,57 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut meta = serde_json::Map::new();
+    let nsys = match &a.nsys {
+        Some(p) => Some(etw_collector::nsight::load(p)?),
+        None => None,
+    };
+    let nsight_only = nsys.is_some() && a.replay.is_none() && a.target.pids.is_empty() && a.target.names.is_empty();
     let raw = match &a.replay {
         Some(p) => {
             meta.insert("replay".into(), json!(p));
             load_raw(p)?
         }
+        None if nsight_only => Vec::new(),
         None => capture(&a, &mut meta)?,
     };
+    let etw_range = (
+        raw.iter().map(|r| r.ts()).filter(|&t| t > 0).min().unwrap_or(0),
+        raw.iter().map(|r| r.ts()).max().unwrap_or(0),
+    );
     if let Some(p) = &a.save_raw {
         save_raw(p, &raw)?;
         eprintln!("raw stream: {p} ({} events)", raw.len());
     }
-    let analysis = spans::analyze(raw, &a.target);
+    let mut analysis = spans::analyze(raw, &a.target);
+    let mut nsight_summary = None;
+    if let Some(n) = &nsys {
+        use etw_collector::nsight;
+        let s = nsight::summarize(n);
+        meta.insert("nsight".into(), s.clone());
+        nsight_summary = Some(s);
+        let merge = if nsight_only {
+            let first = n.kernels.iter().map(|k| k.start).chain(n.api.iter().map(|c| c.start)).min().unwrap_or(0);
+            analysis.t0 = nsight::utc_ns_to_filetime(first);
+            true
+        } else {
+            nsight::overlaps(n, etw_range.0, etw_range.1)
+        };
+        if merge {
+            let extra = nsight::spans(n, analysis.t0);
+            let mut pids: Vec<u32> = extra.iter().map(|s| s.pid).collect();
+            pids.sort_unstable();
+            pids.dedup();
+            for p in pids {
+                if !analysis.targets.contains(&p) {
+                    analysis.targets.push(p);
+                }
+            }
+            eprintln!("nsight: {} kernels / {} CUDA API calls added to the timeline", n.kernels.len(), n.api.len());
+            analysis.spans.extend(extra);
+        } else {
+            eprintln!("nsight: capture does not overlap the ETW capture in time; summary only (metadata.nsight)");
+        }
+    }
     if analysis.targets.is_empty() {
         eprintln!("warning: no process matched the target; the trace will be empty");
     }
@@ -282,6 +327,9 @@ fn main() -> Result<()> {
         }
     }
     print_top(&analysis);
+    if let Some(s) = &nsight_summary {
+        etw_collector::nsight::print_summary(s);
+    }
     if idle > 0 {
         eprintln!("  (+{idle} target processes with no recorded activity; -v to list)");
     }

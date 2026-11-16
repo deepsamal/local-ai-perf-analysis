@@ -81,6 +81,41 @@ walks stacks only for the 1 kHz CPU samples: no blocking stacks or wakers,
 but much less overhead. Keep full captures short (≤ 30 s); the summary warns
 if events were lost.
 
+## Optional: Nsight Systems co-analysis (`--nsys`)
+
+ETW alone is enough for most questions. It shows GPU packets, which threads
+wait and where, and CPU stacks. Nsight's CUPTI trace adds what ETW cannot
+see: CUDA kernel names, every CUDA API call with its duration, and
+memory copies. Use it when you need to know which kernels, or how long
+each `cudaStreamSynchronize` takes:
+
+```powershell
+nsys export -t sqlite -o C:\nsys\run.sqlite C:\nsys\run.nsys-rep
+etw-collector --nsys C:\nsys\run.sqlite -o nsys_report.json          # Nsight-only report
+etw-collector --replay etw.raw.jsonl --process-name ollama --nsys C:\nsys\run.sqlite
+```
+
+The summary splits the capture into GPU-busy segments (requests). For each
+segment it prints GPU utilisation, the time spent in CUDA sync and how busy
+the GPU was during it, and the top kernels. Device-to-host copies of the
+most common size (the logits) mark token boundaries. From these it gives
+per-token time, GPU-busy share, the CPU gap between tokens, and launches
+per token with their CPU cost. When the Nsight session overlaps the ETW
+capture in wall-clock time, kernels, copies and API calls also become
+tracks under the same process. Otherwise only the summary is written
+(`metadata.nsight`).
+
+Getting a usable Nsight capture of a local-model server is fiddly. Version
+support for older GPUs, Ollama's GPU discovery under Nsight, and paths
+with spaces all get in the way. See `docs/NSIGHT_SETUP.md`. The feature
+is a default cargo feature (`nsight`, bundles SQLite);
+`--no-default-features` drops it.
+
+Nsight's tracing has its own observer effect: about 4 µs per kernel
+launch. On the GTX 1080 / qwen2.5:0.5b run, the GPU looked 72% busy under
+Nsight against 89% under ETW. Treat Nsight's idle and gap times as upper
+bounds.
+
 ## Usage
 
 ```powershell
