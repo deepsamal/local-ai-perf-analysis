@@ -1,0 +1,7 @@
+{
+  "name": "mock",
+  "base_url": "http://127.0.0.1:18080/v1",
+  "default_model": "mock-model",
+  "process_names": ["python"],
+  "hooks": {"unload": {"method": "POST", "url": "http://127.0.0.1:18080/unload", "body": {}}}
+}

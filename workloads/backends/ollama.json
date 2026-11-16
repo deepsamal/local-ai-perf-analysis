@@ -1,0 +1,18 @@
+{
+  "name": "ollama",
+  "base_url": "http://127.0.0.1:11434/v1",
+  "api_key": "ollama",
+  "process_names": ["ollama", "llama-server"],
+  "hooks": {
+    "unload": {
+      "method": "POST",
+      "url": "http://127.0.0.1:11434/api/generate",
+      "body": {"model": "{model}", "keep_alive": 0}
+    }
+  },
+  "notes": [
+    "Context length cannot be relied on through /v1. Set OLLAMA_CONTEXT_LENGTH before `ollama serve` (or bake num_ctx into a Modelfile) to at least the largest prompt in the scenario; report.py flags requests the server truncated.",
+    "Concurrency is a server setting: OLLAMA_NUM_PARALLEL (slots per model) and OLLAMA_MAX_LOADED_MODELS. Record the values you ran with.",
+    "The unload hook uses Ollama's native API (keep_alive: 0); it is the only non-OpenAI call in this profile."
+  ]
+}
