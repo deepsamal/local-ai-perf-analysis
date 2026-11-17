@@ -35,6 +35,10 @@ static int max_stack_frames_in_json = 12; /* truncate JSON stacks to keep file s
  * which is why load failures showed up as a bare "-22".
  */
 static int verbose = 0;
+/* Set around load attempts that are expected to fail on some kernels
+ * (the fentry probe set in io_trace.h) so the fallback isn't preceded by
+ * a page of libbpf warnings. --verbose overrides it. */
+static int libbpf_quiet = 0;
 
 /* Stack-emission outcome counters, printed at exit and written into the
  * JSON metadata so "why are my stacks empty?" is answerable from the
@@ -85,6 +89,8 @@ static int libbpf_print_fn(enum libbpf_print_level level,
                            const char *fmt, va_list args)
 {
     if (level == LIBBPF_DEBUG && !verbose)
+        return 0;
+    if (libbpf_quiet && !verbose)
         return 0;
     return vfprintf(stderr, fmt, args);
 }
@@ -423,6 +429,10 @@ static struct tid_state *tid_get(__u32 tid)
     return NULL; /* table full: drop span tracking for this tid */
 }
 
+/* Network / subprocess / disk probes: loader + JSON writer. Uses the
+ * helpers defined above. */
+#include "io_trace.h"
+
 static void output_chrome_tracing_json(const char *filename)
 {
     FILE *f = fopen(filename, "w");
@@ -438,6 +448,9 @@ static void output_chrome_tracing_json(const char *filename)
             min_timestamp = events[i].timestamp;
         }
     }
+    min_timestamp = io_min_ts(min_timestamp);
+    if (min_timestamp == UINT64_MAX)
+        min_timestamp = 0;
     printf("Normalizing timestamps: base=%llu ns (%.3f ms since boot)\n", 
            min_timestamp, min_timestamp / 1000000.0);
     
@@ -650,6 +663,13 @@ static void output_chrome_tracing_json(const char *filename)
         }
     }
     
+    /* Network, subprocess and disk rows. Events are sorted, so the last
+     * one bounds the trace for children that are still running. */
+    {
+        __u64 trace_end = event_count ? events[event_count - 1].timestamp : 0;
+        io_emit_chrome(f, min_timestamp, io_max_ts(trace_end), &output_count);
+    }
+
     fprintf(f, "\n  ],\n");
     fprintf(f, "  \"displayTimeUnit\": \"ms\",\n");
     fprintf(f, "  \"metadata\": {\n");
@@ -659,6 +679,7 @@ static void output_chrome_tracing_json(const char *filename)
             stacks_ok, stacks_lookup_failed, stacks_symbolize_failed,
             stacks_outside_ns, stacks_raw);
     fprintf(f, "    \"outside_pidns_base\": %u,\n", PID_OUTSIDE_NS_BASE);
+    io_emit_metadata(f);
     fprintf(f, "    \"tool\": \"ebpf-unified-trace\"\n");
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
@@ -713,6 +734,21 @@ int main(int argc, char **argv)
             if (sample_period_sync <= 0) sample_period_sync = 1;
         } else if (strcmp(argv[i], "--no-offcpu-stacks") == 0) {
             offcpu_stacks_cli = 0;
+        } else if (strcmp(argv[i], "--io-pid") == 0 && i + 1 < argc) {
+            io_opt_target = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-net") == 0) {
+            io_opt_net = 0;
+        } else if (strcmp(argv[i], "--no-subprocess") == 0) {
+            io_opt_proc = 0;
+        } else if (strcmp(argv[i], "--no-disk") == 0) {
+            io_opt_disk = 0;
+        } else if (strcmp(argv[i], "--io-kprobes") == 0) {
+            io_opt_kprobes_only = 1;
+        } else if (strcmp(argv[i], "--no-follow-children") == 0) {
+            io_opt_follow_children = 0;
+        } else if (strcmp(argv[i], "--disk-min-us") == 0 && i + 1 < argc) {
+            io_opt_disk_min_us = atol(argv[++i]);
+            if (io_opt_disk_min_us < 0) io_opt_disk_min_us = 0;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             verbose = 1;
         } else if (strcmp(argv[i], "--max-stack-frames") == 0 && i + 1 < argc) {
@@ -723,7 +759,16 @@ int main(int argc, char **argv)
                     "Usage: %s [--pid PID] [--duration SEC] [--output FILE]\n"
                     "          [--cuda-lib PATH] [--no-stacks] [--no-symbolize]\n"
                     "          [--stack-sample-async N] [--stack-sample-sync N]\n"
-                    "          [--max-stack-frames N] [--no-offcpu-stacks] [--verbose]\n",
+                    "          [--max-stack-frames N] [--no-offcpu-stacks] [--verbose]\n"
+                    "          [--io-pid PID] [--no-net] [--no-subprocess] [--no-disk]\n"
+                    "          [--no-follow-children] [--disk-min-us N] [--io-kprobes]\n"
+                    "\n"
+                    "  --pid PID      trace this process: scheduling, CUDA, and the network /\n"
+                    "                 subprocess / disk activity of it and its children\n"
+                    "  --io-pid PID   process tree for the network / subprocess / disk probes\n"
+                    "                 only (default: --pid; 0 = every process)\n"
+                    "  --disk-min-us  drop file reads/writes shorter than N microseconds\n"
+                    "  --io-kprobes   use kprobes for net/disk even where fentry works\n",
                     argv[0]);
             return 1;
         }
@@ -744,10 +789,12 @@ int main(int argc, char **argv)
         }
     }
     
-    if (!cuda_lib_path) {
-        fprintf(stderr, "ERROR: CUDA library not found. Specify with --cuda-lib\n");
-        return 1;
-    }
+    /* No libcudart is not an error: an agent whose model runs in another
+     * process (or on the CPU) is still worth tracing for scheduling,
+     * network, subprocess and disk time. */
+    if (!cuda_lib_path)
+        fprintf(stderr, "NOTE: no CUDA library found (use --cuda-lib PATH); "
+                "tracing without CUDA uprobes\n");
     
     printf("Unified CPU+GPU Tracing\n");
     printf("=======================\n");
@@ -757,7 +804,7 @@ int main(int argc, char **argv)
         printf("Target PID: ALL\n");
     }
     printf("Duration: %d seconds\n", duration);
-    printf("CUDA library: %s\n", cuda_lib_path);
+    printf("CUDA library: %s\n", cuda_lib_path ? cuda_lib_path : "(none)");
     printf("Output: %s\n\n", output_file);
     
     /* libbpf logging: warnings always, debug/verifier output with --verbose. */
@@ -877,6 +924,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "WARNING: sched_wakeup program not attached\n");
     }
     
+    /* Network / subprocess / disk probes. After the CPU object (they
+     * share its stack map) and before the GPU one (which then shares
+     * whichever stack map exists). */
+    io_setup(target_pid, pidns_inum, pidns_dev, capture_stacks_cli);
+
+    if (!cuda_lib_path)
+        goto gpu_done;
+
     /* Load GPU CUDA BPF program */
     gpu_obj = bpf_object__open_file("obj/trace_cuda.bpf.o", NULL);
     if (libbpf_get_error(gpu_obj)) {
@@ -1014,6 +1069,12 @@ int main(int argc, char **argv)
     }
     printf("✓ Attached %d CUDA uprobes\n", gpu_link_count);
 
+gpu_done:
+    if (!cpu_obj && !gpu_obj && !io_rb) {
+        fprintf(stderr, "ERROR: no probe surface could be loaded; nothing to trace\n");
+        goto cleanup;
+    }
+
     /* Initialize symbolizer. Safe to call even if --no-symbolize is set;
      * we just skip the bsw_resolve path at JSON-emit time.
      */
@@ -1051,16 +1112,18 @@ int main(int argc, char **argv)
         }
     }
     
-    gpu_map_fd = bpf_object__find_map_fd_by_name(gpu_obj, "cuda_events");
-    if (gpu_map_fd < 0) {
-        fprintf(stderr, "ERROR: failed to find cuda_events map\n");
-        goto cleanup;
-    }
-    
-    gpu_rb = ring_buffer__new(gpu_map_fd, handle_gpu_event, NULL, NULL);
-    if (!gpu_rb) {
-        fprintf(stderr, "ERROR: failed to create GPU ring buffer\n");
-        goto cleanup;
+    if (gpu_obj) {
+        gpu_map_fd = bpf_object__find_map_fd_by_name(gpu_obj, "cuda_events");
+        if (gpu_map_fd < 0) {
+            fprintf(stderr, "ERROR: failed to find cuda_events map\n");
+            goto cleanup;
+        }
+
+        gpu_rb = ring_buffer__new(gpu_map_fd, handle_gpu_event, NULL, NULL);
+        if (!gpu_rb) {
+            fprintf(stderr, "ERROR: failed to create GPU ring buffer\n");
+            goto cleanup;
+        }
     }
     
     signal(SIGINT, sig_handler);
@@ -1077,12 +1140,22 @@ int main(int argc, char **argv)
             err = ring_buffer__poll(cpu_rb, 10);
             if (err == -EINTR) break;
         }
-        
-        err = ring_buffer__poll(gpu_rb, 10);
-        if (err == -EINTR) break;
+        io_poll(10);
+        if (gpu_rb) {
+            err = ring_buffer__poll(gpu_rb, 10);
+            if (err == -EINTR) break;
+        }
+        if (!cpu_rb && !gpu_rb && !io_rb)
+            usleep(10000);
     }
-    
-    printf("\nCollected %d events. Processing...\n", event_count);
+
+    /* Pick up whatever arrived between the last poll and the stop signal. */
+    if (cpu_rb) ring_buffer__consume(cpu_rb);
+    if (io_rb)  ring_buffer__consume(io_rb);
+    if (gpu_rb) ring_buffer__consume(gpu_rb);
+
+    printf("\nCollected %d sched/GPU events, %zu net, %zu subprocess, %zu disk. Processing...\n",
+           event_count, io_net_n, io_proc_n, io_disk_n);
     if (event_count >= MAX_EVENTS)
         fprintf(stderr, "WARNING: hit MAX_EVENTS (%d); later events were dropped\n", MAX_EVENTS);
 
@@ -1146,6 +1219,7 @@ int main(int argc, char **argv)
     
     /* Output Chrome Tracing JSON */
     output_chrome_tracing_json(output_file);
+    io_print_summary();
     printf("  Stacks: %d resolved, %d lookup_failed, %d symbolize_failed, %d outside_pidns, %d raw\n",
            stacks_ok, stacks_lookup_failed, stacks_symbolize_failed, stacks_outside_ns, stacks_raw);
     if (stacks_lookup_failed)
@@ -1159,6 +1233,7 @@ cleanup:
     bpf_link__destroy(sched_wakeup_link);
     for (int i = 0; i < (int)(sizeof(gpu_links)/sizeof(gpu_links[0])); i++)
         bpf_link__destroy(gpu_links[i]);
+    io_cleanup();
     bpf_object__close(cpu_obj);
     bpf_object__close(gpu_obj);
     if (symbolizer) {

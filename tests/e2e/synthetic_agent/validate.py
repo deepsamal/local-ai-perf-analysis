@@ -9,9 +9,10 @@ they're blocked. Running this script produces the project's
 and what it misses.
 
 Exit codes:
-  0 = all Phase 0 assertions pass (whatever else is pending)
+  0 = all Phase 0 assertions pass (whatever else is pending or failing)
   1 = a Phase 0 assertion failed (regression in the existing tool)
   2 = trace file missing / malformed
+  3 = with --strict: a phase 1-3 assertion failed
 """
 
 from __future__ import annotations
@@ -152,77 +153,240 @@ def phase_0_assertions(state: State) -> list[Result]:
     return rs
 
 
-def phase_1_assertions(state: State) -> list[Result]:
-    """Network probes (Task #14). Pending until the trace_net.bpf.c
-    program is in place and unified_trace loads it."""
-    rs: list[Result] = []
-    has_net = "net" in state.categories or any(
-        c.startswith("net") for c in state.categories
-    )
+# Phases 1-3 look at individual events, not just category counts. The
+# agent is deterministic, so each assertion can state what the trace
+# must contain for a given --iters / --latency-ms.
+#
+# Status meanings here:
+#   PEND  the probe surface produced nothing at all (not built, disabled,
+#         or failed to attach) -- the assertion can't be evaluated
+#   PASS / FAIL  the surface is live and the trace does / doesn't hold up
+
+SEARCH_PORT = 8765
+CORPUS_MARK = "/synthetic_agent/corpus/doc_"
+
+
+@dataclass
+class Ctx:
+    """What the phase 1-3 assertions need to know about the run."""
+    events: list
+    agent_pid: int | None
+    iters: int
+    latency_ms: int
+    measured_ms: dict = field(default_factory=dict)
+
+    def mine(self, e: dict) -> bool:
+        return self.agent_pid is None or e.get("pid") == self.agent_pid
+
+
+def _stack_syms(e: dict) -> list[str]:
+    stack = (e.get("args") or {}).get("stack") or []
+    out = []
+    for fr in stack:
+        if isinstance(fr, dict):
+            out.append(f"{fr.get('sym', '')} {fr.get('file', '')}")
+    return out
+
+
+def _stack_resolved(e: dict) -> bool:
+    stack = (e.get("args") or {}).get("stack") or []
+    return any(isinstance(fr, dict) and fr.get("sym") not in (None, "", "??")
+               for fr in stack)
+
+
+def _stack_mentions(evs: list, *needles: str) -> int:
+    """How many of `evs` have a frame naming any of `needles`."""
+    n = 0
+    for e in evs:
+        if any(nd in s for s in _stack_syms(e) for nd in needles):
+            n += 1
+    return n
+
+
+def _attribution_results(evs: list, what: str, func: str, phase: int) -> list[Result]:
+    """Two-step stack check shared by all three phases: do the stacks
+    resolve at all, and do they reach the agent's Python function."""
+    with_stack = [e for e in evs if "stack" in (e.get("args") or {})]
+    resolved = [e for e in with_stack if _stack_resolved(e)]
+    rs = [Result(
+        f"{what} stacks resolve to symbols",
+        "PASS" if resolved else "FAIL",
+        f"{len(resolved)}/{len(with_stack)} stacks resolved ({len(evs)} events)",
+        phase=phase,
+    )]
+    hits = _stack_mentions(with_stack, func, "agent.py")
     rs.append(Result(
+        f"{what} stacks include {func}() / agent.py",
+        "PASS" if hits else "FAIL",
+        f"{hits}/{len(with_stack)} stacks name the agent's Python code"
+        + ("" if hits else " -- native frames only; Python frames need a "
+           "frame-pointer build of CPython plus -X perf (docs/PYTHON_ATTRIBUTION.md)"),
+        phase=phase,
+    ))
+    return rs
+
+
+def _pending(names: list[str], why: str, phase: int) -> list[Result]:
+    return [Result(n, "PEND", why, phase=phase) for n in names]
+
+
+def phase_1_assertions(ctx: Ctx) -> list[Result]:
+    """Network probes (trace_net.bpf.c)."""
+    names = [
         "trace has 'net' category events",
-        "PASS" if has_net else "PEND",
-        "requires Phase 1 (network probes)" if not has_net else
-        f"{sum(1 for c in state.categories if c.startswith('net'))} net categories",
-        phase=1,
-    ))
+        "search_tool() calls captured as request/response pairs",
+        "network wait matches iterations x server latency (within 20%)",
+        "peer identified as loopback",
+        "network stacks resolve to symbols",
+        "network stacks include search_tool() / agent.py",
+    ]
+    all_net = [e for e in ctx.events if str(e.get("cat", "")).startswith("net")]
+    if not all_net:
+        return _pending(names, "no network events in trace (probes not attached?)", 1)
+
+    def to_server(e):
+        return ctx.mine(e) and str((e.get("args") or {}).get("peer", "")).endswith(f":{SEARCH_PORT}")
+
+    calls = [e for e in all_net if e.get("cat") == "net" and to_server(e)]
+    sends = [e for e in calls if e["name"] == "tcp_send" and e["args"].get("bytes", 0) > 0]
+    recvs = [e for e in calls if e["name"] == "tcp_recv" and e["args"].get("bytes", 0) > 0]
+    waits = [e for e in all_net if e.get("cat") == "net_wait" and to_server(e)]
+    wait_ms = sum(e.get("dur", 0) for e in waits) / 1000.0
+    expect_ms = ctx.iters * ctx.latency_ms
+    ctx.measured_ms["network"] = wait_ms
+
+    rs = [Result(names[0], "PASS", f"{len(all_net)} events", phase=1)]
+    ok = len(waits) == ctx.iters and len(sends) >= ctx.iters and len(recvs) >= ctx.iters
     rs.append(Result(
-        "search_tool() calls captured as network events",
-        "PEND" if not has_net else "PASS",
-        "requires Phase 1 (network probes)",
+        names[1], "PASS" if ok else "FAIL",
+        f"{len(waits)} await-response spans (expected {ctx.iters}); "
+        f"{len(sends)} sends, {len(recvs)} recvs to :{SEARCH_PORT}",
         phase=1,
     ))
+    within = expect_ms > 0 and abs(wait_ms - expect_ms) <= 0.2 * expect_ms
     rs.append(Result(
-        "network event stacks include synthetic_agent.py",
-        "PEND" if not has_net else "PASS",
-        "requires Phase 1 (network probes)",
+        names[2], "PASS" if within else "FAIL",
+        f"measured {wait_ms:.0f} ms vs expected {expect_ms} ms "
+        f"({(wait_ms - expect_ms) / expect_ms * 100:+.1f}%)" if expect_ms else "no expectation",
         phase=1,
     ))
+    lo = [e for e in calls if e["args"].get("loopback") is True]
+    rs.append(Result(
+        names[3], "PASS" if calls and len(lo) == len(calls) else "FAIL",
+        f"{len(lo)}/{len(calls)} calls flagged loopback",
+        phase=1,
+    ))
+    rs += _attribution_results(sends + waits, "network", "search_tool", 1)
     return rs
 
 
-def phase_2_assertions(state: State) -> list[Result]:
-    """Subprocess probes (Task #16). Pending until trace_process.bpf.c
-    is in place."""
-    rs: list[Result] = []
-    has_sp = "subprocess" in state.categories
-    rs.append(Result(
+def phase_2_assertions(ctx: Ctx) -> list[Result]:
+    """Subprocess probes (trace_process.bpf.c)."""
+    names = [
         "trace has 'subprocess' category events",
-        "PASS" if has_sp else "PEND",
-        "requires Phase 2 (subprocess probes)" if not has_sp else "ok",
-        phase=2,
-    ))
+        "run_code_tool() spawns captured as fork + exec",
+        "subprocess lifetime matches the snippet's sleep",
+        "every spawned child is reaped by a captured wait",
+        "subprocess stacks resolve to symbols",
+        "subprocess stacks include run_code_tool() / agent.py",
+    ]
+    all_sp = [e for e in ctx.events if e.get("cat") == "subprocess"]
+    if not all_sp:
+        return _pending(names, "no subprocess events in trace (probes not attached?)", 2)
+
+    spawns = sorted(
+        (e for e in all_sp if e.get("ph") == "X" and "child_pid" in (e.get("args") or {})
+         and ctx.mine(e)),
+        key=lambda e: e["ts"],
+    )
+    waits = [e for e in all_sp if e.get("ph") == "X" and e.get("name") in ("wait4", "waitid")
+             and ctx.mine(e)]
+    ctx.measured_ms["subprocess"] = sum(e.get("dur", 0) for e in spawns) / 1000.0
+
+    # The agent runs snippet (step % 5) on every third step; snippet k
+    # sleeps 100 + 100k ms.
+    steps = [i for i in range(ctx.iters) if i % 3 == 0]
+    expect_sleep = [100 + (i % 5) * 100 for i in steps]
+
+    rs = [Result(names[0], "PASS", f"{len(all_sp)} events", phase=2)]
+    py = [e for e in spawns if "python" in str(e["args"].get("exec", ""))]
     rs.append(Result(
-        "run_code_tool() spawns captured as fork/exec events",
-        "PEND" if not has_sp else "PASS",
-        "requires Phase 2",
+        names[1],
+        "PASS" if len(spawns) == len(steps) and len(py) == len(spawns) else "FAIL",
+        f"{len(spawns)} children of the agent (expected {len(steps)}), "
+        f"{len(py)} exec'd a python interpreter",
         phase=2,
     ))
+
+    # Allow interpreter start-up on top of the sleep, nothing below it.
+    slack_ms = 400
+    life = [e.get("dur", 0) / 1000.0 for e in spawns]
+    good = len(life) == len(expect_sleep) and all(
+        want <= got <= want + slack_ms for got, want in zip(life, expect_sleep))
     rs.append(Result(
-        "subprocess events include wait4 duration",
-        "PEND" if not has_sp else "PASS",
-        "requires Phase 2",
+        names[2], "PASS" if good else "FAIL",
+        "lifetimes " + ", ".join(f"{x:.0f}" for x in life) + " ms vs sleeps "
+        + ", ".join(str(x) for x in expect_sleep) + f" ms (+0..{slack_ms} ms start-up)",
         phase=2,
     ))
+
+    reaped = {e["args"].get("reaped_pid") for e in waits}
+    missing = [e["args"]["child_pid"] for e in spawns if e["args"]["child_pid"] not in reaped]
+    wait_ms = [e.get("dur", 0) / 1000.0 for e in waits if e["args"].get("reaped_pid")]
+    rs.append(Result(
+        names[3], "PASS" if spawns and not missing else "FAIL",
+        f"{len(spawns) - len(missing)}/{len(spawns)} children reaped; the reaping wait itself "
+        f"took {max(wait_ms, default=0):.2f} ms at most -- subprocess.run() blocks on the "
+        "child's pipes and only then calls wait4, so the stall is the lifetime span, not wait4",
+        phase=2,
+    ))
+    rs += _attribution_results(spawns, "subprocess", "run_code_tool", 2)
     return rs
 
 
-def phase_3_assertions(state: State) -> list[Result]:
-    """Disk probes (Task #15). Pending until trace_disk.bpf.c is in place."""
-    rs: list[Result] = []
-    has_disk = "disk" in state.categories
-    rs.append(Result(
+def phase_3_assertions(ctx: Ctx) -> list[Result]:
+    """Disk probes (trace_disk.bpf.c)."""
+    names = [
         "trace has 'disk' category events",
-        "PASS" if has_disk else "PEND",
-        "requires Phase 3 (disk probes)" if not has_disk else "ok",
-        phase=3,
-    ))
-    rs.append(Result(
         "read_documents() reads captured with path attribution",
-        "PEND" if not has_disk else "PASS",
-        "requires Phase 3",
+        "path resolution succeeded on >= 80% of file events",
+        "disk stacks resolve to symbols",
+        "disk stacks include read_documents() / agent.py",
+    ]
+    all_disk = [e for e in ctx.events if e.get("cat") == "disk"]
+    if not all_disk:
+        return _pending(names, "no disk events in trace (probes not attached?)", 3)
+
+    mine = [e for e in all_disk if ctx.mine(e)]
+    corpus = [e for e in mine if e["args"].get("op") == "read"
+              and CORPUS_MARK in str(e["args"].get("path", ""))]
+    ctx.measured_ms["disk"] = sum(e.get("dur", 0) for e in corpus) / 1000.0
+
+    want_docs = set()
+    for i in range(ctx.iters):
+        want_docs |= {i % 20, (i + 7) % 20, (i + 13) % 20}
+    got_docs = set()
+    for e in corpus:
+        tail = str(e["args"]["path"]).rsplit("doc_", 1)[-1].split(".")[0]
+        if tail.isdigit():
+            got_docs.add(int(tail))
+
+    rs = [Result(names[0], "PASS", f"{len(all_disk)} events", phase=3)]
+    ok = len(corpus) >= 3 * ctx.iters and want_docs <= got_docs
+    rs.append(Result(
+        names[1], "PASS" if ok else "FAIL",
+        f"{len(corpus)} reads under the corpus (expected >= {3 * ctx.iters}); "
+        f"{len(want_docs & got_docs)}/{len(want_docs)} expected documents seen",
         phase=3,
     ))
+    absolute = [e for e in mine if e["args"].get("path_absolute") is True]
+    frac = len(absolute) / len(mine) if mine else 0.0
+    rs.append(Result(
+        names[2], "PASS" if frac >= 0.8 else "FAIL",
+        f"{len(absolute)}/{len(mine)} agent file events have an absolute path ({frac * 100:.0f}%)",
+        phase=3,
+    ))
+    rs += _attribution_results(corpus, "disk", "read_documents", 3)
     return rs
 
 
@@ -281,7 +445,9 @@ def _estimate_invisible_time(
     }
 
 
-def _print_state_report(state: State, iters: int) -> None:
+def _print_state_report(state: State, iters: int, latency_ms: int = 150,
+                        measured_ms: dict | None = None) -> None:
+    measured_ms = measured_ms or {}
     print(f"\n{BOLD}=== state report ==={RESET}")
     print(f"  events:        {state.events_total} total / {state.events_real} real")
     print(f"  categories:    {', '.join(sorted(state.categories)) or '(none)'}")
@@ -294,7 +460,7 @@ def _print_state_report(state: State, iters: int) -> None:
           f"(sum of all event durations — overlap counted multiply)")
 
     # The killer signal: how much of the agent is INVISIBLE today.
-    est = _estimate_invisible_time(iters)
+    est = _estimate_invisible_time(iters, latency_ms)
     total_est = sum(est.values())
 
     visible_classes = []
@@ -321,7 +487,8 @@ def _print_state_report(state: State, iters: int) -> None:
     print(f"  {DIM}(synthetic — recomputes if you tune AGENT_ITERS / latency){RESET}")
     print(f"    visible to tool:   {visible_s*1000:6.0f} ms  ({visible_s/total_est*100:4.1f}%)")
     for cls, t in visible_classes:
-        print(f"      {GREEN}+{RESET} {cls:11s} {t*1000:6.0f} ms")
+        got = f"   measured {measured_ms[cls]:7.1f} ms" if cls in measured_ms else ""
+        print(f"      {GREEN}+{RESET} {cls:11s} {t*1000:6.0f} ms{got}")
     print(f"    invisible to tool: {invisible_s*1000:6.0f} ms  ({invisible_s/total_est*100:4.1f}%)")
     for cls, t in invisible_classes:
         print(f"      {YELLOW}-{RESET} {cls:11s} {t*1000:6.0f} ms")
@@ -337,8 +504,16 @@ def main() -> int:
     parser.add_argument("trace", type=Path)
     parser.add_argument("--iters", type=int, default=10,
                         help="must match AGENT_ITERS used in the run")
+    parser.add_argument("--agent-pid", type=int, default=None,
+                        help="pid of the synthetic agent; phase 1-3 assertions "
+                        "then only count its events")
+    parser.add_argument("--latency-ms", type=int, default=150,
+                        help="must match the fake search server's --latency-ms")
     parser.add_argument("--write-report", type=Path, default=None,
                         help="optionally write a Markdown state report")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 3 when a phase 1-3 assertion fails "
+                        "(default: only Phase 0 failures are fatal)")
     args = parser.parse_args()
 
     if not args.trace.exists():
@@ -347,46 +522,63 @@ def main() -> int:
 
     data, state = _parse_trace(args.trace)
 
+    ctx = Ctx(
+        events=[e for e in data.get("traceEvents", []) if e.get("ph") != "M"],
+        agent_pid=args.agent_pid,
+        iters=args.iters,
+        latency_ms=args.latency_ms,
+    )
     phase_results = {
         0: phase_0_assertions(state),
-        1: phase_1_assertions(state),
-        2: phase_2_assertions(state),
-        3: phase_3_assertions(state),
+        1: phase_1_assertions(ctx),
+        2: phase_2_assertions(ctx),
+        3: phase_3_assertions(ctx),
     }
     _print_phase("Phase 0 — foundation (must pass today)", phase_results[0])
     _print_phase("Phase 1 — network bottleneck visibility (Task #14)", phase_results[1])
     _print_phase("Phase 2 — subprocess bottleneck visibility (Task #16)", phase_results[2])
     _print_phase("Phase 3 — disk bottleneck visibility (Task #15)", phase_results[3])
-    _print_state_report(state, args.iters)
+    _print_state_report(state, args.iters, args.latency_ms, ctx.measured_ms)
 
     # Summary
     phase_0_fails = [r for r in phase_results[0] if r.status == "FAIL"]
+    later_fails = [r for p, rs in phase_results.items() if p > 0
+                   for r in rs if r.status == "FAIL"]
     n_pend = sum(1 for rs in phase_results.values() for r in rs if r.status == "PEND")
     n_pass = sum(1 for rs in phase_results.values() for r in rs if r.status == "PASS")
 
     print(f"\n{BOLD}=== summary ==={RESET}")
     print(f"  passing:   {n_pass}")
-    print(f"  pending:   {n_pend}  (each blocked on a specific roadmap task)")
-    print(f"  failing:   {len(phase_0_fails)}")
+    print(f"  pending:   {n_pend}  (probe surface produced no events)")
+    print(f"  failing:   {len(phase_0_fails) + len(later_fails)}")
+    for r in phase_0_fails + later_fails:
+        print(f"    {RED}-{RESET} phase {r.phase}: {r.name}")
 
     if args.write_report:
         _write_markdown_report(
-            args.write_report, args.trace, data, state, phase_results, args.iters
+            args.write_report, args.trace, data, state, phase_results, args.iters,
+            args.latency_ms, ctx.measured_ms,
         )
         print(f"\n  wrote markdown state report to {args.write_report}")
 
     if phase_0_fails:
         print(f"\n{RED}STATUS: FAIL{RESET} — Phase 0 has {len(phase_0_fails)} broken assertion(s)")
         return 1
-    print(f"\n{GREEN}STATUS: BASELINE OK{RESET} — Phase 0 passes; "
-          f"{n_pend} assertions pending later roadmap phases")
+    if later_fails:
+        print(f"\n{YELLOW}STATUS: BASELINE OK, GAPS{RESET} — Phase 0 passes; "
+              f"{len(later_fails)} phase 1-3 assertion(s) fail, {n_pend} pending")
+        return 3 if args.strict else 0
+    print(f"\n{GREEN}STATUS: OK{RESET} — Phase 0 passes; "
+          f"{n_pend} assertions pending")
     return 0
 
 
 def _write_markdown_report(
     path: Path, trace_path: Path, data: dict, state: State,
-    phase_results: dict, iters: int,
+    phase_results: dict, iters: int, latency_ms: int = 150,
+    measured_ms: dict | None = None,
 ) -> None:
+    measured_ms = measured_ms or {}
     """Write a state-of-the-art report for commit alongside the roadmap."""
     lines: list[str] = []
     lines.append("# Synthetic agent state report")
@@ -426,14 +618,14 @@ def _write_markdown_report(
             lines.append(f"| {r.status} | {r.name} | {r.detail} |")
         lines.append("")
 
-    est = _estimate_invisible_time(iters)
+    est = _estimate_invisible_time(iters, latency_ms)
     total = sum(est.values())
     lines.append("## Estimated agent wall-clock attribution")
     lines.append("")
     lines.append("Synthetic numbers (the agent is deterministic so we can predict the budget):")
     lines.append("")
-    lines.append("| Bottleneck class | Estimated time | Visible today? |")
-    lines.append("|---|---|---|")
+    lines.append("| Bottleneck class | Estimated time | Visible today? | Measured in this trace |")
+    lines.append("|---|---|---|---|")
     visible_pct = 0.0
     for cls in ("gpu", "network", "subprocess", "disk"):
         t_ms = est[cls] * 1000
@@ -445,16 +637,24 @@ def _write_markdown_report(
         )
         if visible:
             visible_pct += t_ms / (total * 1000) * 100
+        got = f"{measured_ms[cls]:.1f} ms" if cls in measured_ms else "—"
         lines.append(
-            f"| {cls} | ~{t_ms:.0f} ms | {'✅ yes' if visible else '❌ no — see roadmap'} |"
+            f"| {cls} | ~{t_ms:.0f} ms | {'✅ yes' if visible else '❌ no — see roadmap'} | {got} |"
         )
     lines.append("")
     lines.append(
         f"**Current visibility: ~{visible_pct:.0f}% of estimated agent wall-clock.**"
     )
+    if visible_pct < 99.5:
+        lines.append(
+            f"The remaining ~{100-visible_pct:.0f}% lives in bottleneck classes the tool "
+            "doesn't yet instrument — see [ROADMAP.md](ROADMAP.md) Phases 1–3."
+        )
+    lines.append("")
     lines.append(
-        f"The remaining ~{100-visible_pct:.0f}% lives in bottleneck classes the tool "
-        "doesn't yet instrument — see [ROADMAP.md](ROADMAP.md) Phases 1–3."
+        "Network is the time from the last byte of each request to the first byte "
+        "of its reply; subprocess is fork-to-exit lifetime; disk is time inside "
+        "`vfs_read` on the corpus files (page-cache hits included)."
     )
     lines.append("")
     path.write_text("\n".join(lines))

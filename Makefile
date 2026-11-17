@@ -78,7 +78,7 @@ dirs:
 
 # ---------- BPF programs ----------
 
-$(OBJ_DIR)/%.bpf.o: $(BPF_DIR)/%.bpf.c $(INC_DIR)/common.h $(INC_DIR)/maps.h $(INC_DIR)/pidns.h
+$(OBJ_DIR)/%.bpf.o: $(BPF_DIR)/%.bpf.c $(INC_DIR)/common.h $(INC_DIR)/maps.h $(INC_DIR)/pidns.h $(INC_DIR)/io_common.h
 	$(CLANG) $(CLANG_FLAGS) -c $< -o $@
 
 # ---------- blazesym wrapper (Rust) ----------
@@ -101,6 +101,15 @@ endif
 $(BIN_DIR)/%: $(USER_DIR)/%.c $(INC_DIR)/common.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Network / subprocess / disk probes (roadmap Phases 1-3): three BPF
+# objects loaded by unified_trace at run time, plus the header-only
+# user-space half that unified_trace.c includes.
+IO_DEPS := $(OBJ_DIR)/trace_net.bpf.o \
+           $(OBJ_DIR)/trace_process.bpf.o \
+           $(OBJ_DIR)/trace_disk.bpf.o \
+           $(USER_DIR)/io_trace.h \
+           $(INC_DIR)/io_common.h
+
 # unified_trace links the blazesym archive when available. Falling
 # back to a stub keeps the build succeeding in environments without
 # Rust; the C side has runtime null-checks for symbolizer == NULL.
@@ -108,6 +117,7 @@ ifdef HAVE_CARGO
 $(BIN_DIR)/unified_trace: $(USER_DIR)/unified_trace.c \
                           $(OBJ_DIR)/trace_cpu_sched.bpf.o \
                           $(OBJ_DIR)/trace_cuda.bpf.o \
+                          $(IO_DEPS) \
                           $(BLAZESYM_LIB) \
                           $(SYM_DIR)/blazesym_wrap.h \
                           $(INC_DIR)/common.h
@@ -129,6 +139,7 @@ $(OBJ_DIR)/blazesym_stub.o: $(SYM_DIR)/blazesym_wrap.h
 $(BIN_DIR)/unified_trace: $(USER_DIR)/unified_trace.c \
                           $(OBJ_DIR)/trace_cpu_sched.bpf.o \
                           $(OBJ_DIR)/trace_cuda.bpf.o \
+                          $(IO_DEPS) \
                           $(OBJ_DIR)/blazesym_stub.o \
                           $(SYM_DIR)/blazesym_wrap.h \
                           $(INC_DIR)/common.h

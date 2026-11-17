@@ -21,7 +21,11 @@ BIN="$REPO_ROOT/bin/unified_trace"
 
 # Tunables (env-overridable so the same script works during dev and CI).
 AGENT_ITERS="${AGENT_ITERS:-10}"
-AGENT_WARMUP_S="${AGENT_WARMUP_S:-3}"
+# The agent sleeps this long after printing its pid so the tracer can
+# finish attaching first. 3 s stopped being enough once the tracer grew
+# to five BPF objects: the first search request went out mid-attach and
+# was caught only on its receive side.
+AGENT_WARMUP_S="${AGENT_WARMUP_S:-8}"
 SEARCH_LATENCY_MS="${SEARCH_LATENCY_MS:-150}"
 DURATION="${DURATION:-25}"
 OUT="${OUT:-/tmp/synthetic_trace.json}"
@@ -182,7 +186,12 @@ fi
 # ----- 5. tracer (system-wide because the --pid filter has known issues
 # we deferred to a follow-up — see ROADMAP / project_status memory).
 echo "=== starting tracer (duration=${DURATION}s) ==="
-"$BIN" "${CUDA_ARG[@]}" --duration "$DURATION" --output "$OUT" \
+# Scheduling and CUDA stay system-wide; the network / subprocess / disk
+# probes follow the agent's process tree (the agent and the tools it
+# spawns), which is what --io-pid selects.
+IO_ARG=()
+[[ -n "$REAL_AGENT_PID" ]] && IO_ARG=(--io-pid "$REAL_AGENT_PID")
+"$BIN" "${CUDA_ARG[@]}" "${IO_ARG[@]}" --duration "$DURATION" --output "$OUT" \
        --stack-sample-async 4 --stack-sample-sync 1 &
 TRACER_PID=$!
 
@@ -205,6 +214,10 @@ grep '^AGENT_' /tmp/syn_agent.out || true
 
 # ----- 7. validate + state report
 echo
+AGENT_PID_ARG=()
+[[ -n "$REAL_AGENT_PID" ]] && AGENT_PID_ARG=(--agent-pid "$REAL_AGENT_PID")
 "$PYBIN" "$HERE/validate.py" "$OUT" \
     --iters "$AGENT_ITERS" \
+    --latency-ms "$SEARCH_LATENCY_MS" \
+    "${AGENT_PID_ARG[@]}" \
     --write-report "$REPORT"

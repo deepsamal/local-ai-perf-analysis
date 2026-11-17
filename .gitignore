@@ -34,3 +34,6 @@ runs/wsl-jobs/
 runs/wsl/
 windows/etw-collector/target/
 runs/etw/
+
+# Python bytecode
+__pycache__/

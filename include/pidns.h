@@ -50,6 +50,7 @@ struct task_struct {
     char comm[16];
     struct pid *thread_pid;
     struct task_struct *group_leader;
+    int exit_code;      /* wait status, valid from do_exit() on */
 } __attribute__((preserve_access_index));
 
 /* Up to 4 pid-namespace levels: root -> WSL distro -> container -> nested. */
