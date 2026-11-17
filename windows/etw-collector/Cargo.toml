@@ -9,11 +9,17 @@ license = "MIT"
 anyhow = "1"
 cpp_demangle = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# Out-of-process Python stack sampling (src/pysample.rs). Library only: no
+# native unwinding, so none of py-spy's libunwind dependency.
+py-spy = { version = "0.4", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [features]
-default = ["nsight"]
+default = ["nsight", "pyspy"]
+# Python frames for target processes that are CPython interpreters.
+# `--no-default-features --features nsight` builds without it.
+pyspy = ["dep:py-spy"]
 # Optional co-analysis of `nsys export -t sqlite` files (--nsys).
 nsight = ["dep:rusqlite"]
 

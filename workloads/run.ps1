@@ -44,7 +44,11 @@ if (-not $NoCollector) {
     }
     $be = Get-Content $Backend -Raw | ConvertFrom-Json
     $cargs = @()
-    foreach ($n in $be.process_names) { $cargs += @("--process-name", $n) }
+    # Trace the agent as well as the backend: the driver (and the tools and
+    # hogs it spawns) is a Python process, and the collector samples Python
+    # stacks only in processes it was told to trace.
+    $names = @($be.process_names) + @("python", [IO.Path]::GetFileNameWithoutExtension($Python)) | Select-Object -Unique
+    foreach ($n in $names) { $cargs += @("--process-name", $n) }
     $cargs += @("--follow-children", "--duration", "$Duration", "--output", "$out.json", "--save-raw", "$out.raw.jsonl")
     if ($Stacks -ne "off") { $cargs += "--stacks=$Stacks" }
     # Start-Process does not quote arguments; paths here can contain spaces.

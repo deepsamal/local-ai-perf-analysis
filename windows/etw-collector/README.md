@@ -44,6 +44,7 @@ module rundown and DbgHelp symbolisation at the end of the capture:
 | CSwitch | where the thread was waiting | `args.stack` on each *Off-CPU (blocked)* span; `<output>.offcpu.folded`, weighted by µs blocked |
 | ReadyThread | who woke it, and from where | `args.woken_by` and `args.waker_stack` on the blocked span |
 | SampledProfile (1 kHz) | what the thread was doing on-CPU | `<output>.oncpu.folded`; hot frames printed in the summary |
+| GPU packets (both modes; no extra stack walk) | which code submitted the GPU work: the on-CPU sample of the submitting thread nearest the packet, within 2 ms | `submit_thread` and `args.stack` on GPU spans (the stack once per run of identical ones); `<output>.gpu.folded`, weighted by µs of GPU execution |
 
 Threads are labelled with their name, or failing that their resolved entry
 point (`ggml-cuda.dll!...`, `ntdll.dll!TppWorkerThread`), instead of a bare
@@ -80,6 +81,36 @@ Go's `ollama.exe`, which switches threads constantly. `--stacks=sample`
 walks stacks only for the 1 kHz CPU samples: no blocking stacks or wakers,
 but much less overhead. Keep full captures short (≤ 30 s); the summary warns
 if events were lost.
+
+## Python frames (on by default, no admin)
+
+ETW stacks stop at the interpreter: every Python call is the same
+`_PyEval_EvalFrameDefault`. For target processes that are CPython
+interpreters the collector therefore samples the Python stack from outside
+the process with the [py-spy](https://github.com/benfred/py-spy) library
+(`src/pysample.rs`). It works on the Python the user already has: no debug
+build, no restart, nothing loaded into the target.
+
+| Output | Content |
+|---|---|
+| `Python: <thread>` track | one slice per stretch where the thread's Python stack did not change, named by the leaf function |
+| `args.py_stack` on *Off-CPU (blocked)* spans | the Python code the thread was in while it waited (`py_match` says whether a sample fell inside the wait or the nearest one within 50 ms was used) |
+| `args.py_stack` on TCP events, `metadata.python_network` | bytes sent and received per Python call site and remote. A send is matched through the thread that logged it; received data is logged from a system thread, so it goes to the only Python thread sitting in a socket call at that moment, or stays unmatched when there are none or several (`py_match` says which) |
+| `<output>.py-offcpu.folded` | Python stacks weighted by µs blocked, with the wait reason as leaf |
+| `<output>.py.folded` | Python stacks weighted by samples (wall clock: waiting threads are sampled too) |
+
+It is a sampler (100 Hz, `--py-rate`), not an event-time unwinder. A wait
+longer than the sampling period gets its exact stack; a shorter one gets a
+neighbouring sample. Sampling is non-blocking: the target is never
+suspended, so the scheduling data is not disturbed. The summary line
+reports read errors and the sampler's own CPU cost.
+
+The blocked-span join needs the kernel session (Administrator). Without it
+you still get the Python tracks and `py.folded`. `--no-py` turns it off;
+`--py-selftest PID` samples one process and prints what it sees, without
+ETW, on any OS. Processes that start mid-capture are picked up within about
+a second if the collector can see process starts (Administrator); a Python
+child that lives for less than that is missed.
 
 ## Optional: Nsight Systems co-analysis (`--nsys`)
 
@@ -153,8 +184,8 @@ the analysis on a saved capture without re-tracing.
 ## Not yet
 
 * Go symbol table (pclntab) reader for `ollama.exe` frames.
-* Python frames. These will come from py-spy or similar, and the same gap
-  exists on Linux.
+* Python frames on the Linux tracer (`unified_trace`); the sampler module is
+  portable but only wired into this collector.
 * HTTP-level semantics for Ollama/OpenAI-compatible APIs (load, prefill and
   decode phases).
 * NPU (DirectML/MCDM) engines. They show up as DxgKrnl contexts, but are not

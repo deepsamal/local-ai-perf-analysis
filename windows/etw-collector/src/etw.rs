@@ -50,6 +50,11 @@ pub struct Options {
     /// rundown and DbgHelp symbolisation (kernel session, Administrator).
     pub stacks: StackMode,
     pub symbol_path: Option<String>,
+    /// Sample Python stacks of target processes that are CPython
+    /// interpreters (out of process, py-spy; no privilege beyond access
+    /// to the process).
+    pub python: bool,
+    pub py_rate: u32,
 }
 
 /// Which events get a kernel stack walk.
@@ -109,6 +114,8 @@ pub struct CaptureResult {
     pub stack_stats: BTreeMap<String, u64>,
     pub kernel_stats: Option<winsys::SessionStats>,
     pub user_stats: Option<winsys::SessionStats>,
+    /// Python sampler statistics (null when off or not built in).
+    pub python: serde_json::Value,
 }
 
 type Sh = Arc<Mutex<Shared>>;
@@ -467,7 +474,9 @@ fn dxg_cb(sh: Sh, verbose: bool) -> impl FnMut(&EventRecord, &SchemaLocator) + S
                 let packet_type = if id == DXG_QUEUE_START { p.u32("PacketType") } else { Some(0) };
                 match (p.ptr("hContext"), p.u32("SubmitSequence"), packet_type) {
                     (Some(ctx), Some(seq), Some(packet_type)) => {
-                        Raw::GpuQueueStart { ts, pid: rec.process_id(), ctx, seq, packet_type }
+                        // The submitting thread is what ties a packet to code:
+                        // spans.rs joins it to that thread's on-CPU samples.
+                        Raw::GpuQueueStart { ts, pid: rec.process_id(), tid: rec.thread_id(), ctx, seq, packet_type }
                     }
                     _ => return,
                 }
@@ -506,7 +515,7 @@ fn net_cb(sh: Sh) -> impl FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 's
             // Port fields are logged in network byte order.
             let rport = p.u16("dport").map(u16::from_be).unwrap_or(0);
             let lport = p.u16("sport").map(u16::from_be).unwrap_or(0);
-            push(&sh, Raw::Tcp { ts: rec.raw_timestamp(), pid, send, bytes, raddr, rport, lport });
+            push(&sh, Raw::Tcp { ts: rec.raw_timestamp(), pid, tid: rec.thread_id(), send, bytes, raddr, rport, lport });
         }
     }
 }
@@ -749,6 +758,17 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
         return Err(anyhow!("no ETW session could be started:\n  {}", notes.join("\n  ")));
     }
 
+    #[cfg(feature = "pyspy")]
+    let py_sampler = if o.python {
+        let shc = sh.clone();
+        Some(crate::pysample::start(
+            Box::new(move || shc.lock().map(|s| s.filter.target_procs()).unwrap_or_default()),
+            o.py_rate,
+        ))
+    } else {
+        None
+    };
+
     let t0 = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if let Some(d) = o.duration {
@@ -759,6 +779,10 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
         std::thread::sleep(Duration::from_millis(100));
     }
     let elapsed = t0.elapsed();
+    // Stop sampling with the capture window; tearing the ETW sessions down
+    // below can take seconds on a busy machine.
+    #[cfg(feature = "pyspy")]
+    let py_result = py_sampler.map(|p| p.finish());
     let kernel_session = kernel.is_some();
     let user_session = user.is_some();
     let kernel_stats = if kernel_session { winsys::session_stats(KERNEL_SESSION) } else { None };
@@ -774,8 +798,22 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
         }
     }
 
+    #[allow(unused_mut)]
+    let mut python = serde_json::Value::Null;
+    #[cfg(feature = "pyspy")]
+    let py_events = match py_result {
+        Some(r) => {
+            notes.extend(r.notes);
+            python = serde_json::to_value(&r.stats).unwrap_or_default();
+            r.events
+        }
+        None => Vec::new(),
+    };
+
     let mut s = sh.lock().unwrap();
     let mut events = std::mem::take(&mut s.events);
+    #[cfg(feature = "pyspy")]
+    events.extend(py_events);
     if o.stacks.on() {
         let t = Instant::now();
         let mut thread_pid = HashMap::new();
@@ -823,5 +861,6 @@ pub fn capture(o: &Options, stop: Arc<AtomicBool>) -> Result<CaptureResult> {
         kept: s.filter.kept,
         dropped: s.filter.dropped,
         elapsed,
+        python,
     })
 }

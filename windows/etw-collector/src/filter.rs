@@ -17,6 +17,8 @@ pub struct LiveFilter {
     pids: HashSet<u32>,
     tid_pid: HashMap<u32, u32>,
     ctxs: HashSet<u64>,
+    /// Image name of every process seen, for `target_procs`.
+    names: HashMap<u32, String>,
     pub kept: u64,
     pub dropped: u64,
 }
@@ -35,11 +37,17 @@ impl LiveFilter {
         &self.pids
     }
 
+    /// Current target processes with their image names.
+    pub fn target_procs(&self) -> Vec<(u32, String)> {
+        self.pids.iter().map(|p| (*p, self.names.get(p).cloned().unwrap_or_default())).collect()
+    }
+
     /// Returns true if the event should be buffered.
     pub fn observe(&mut self, r: &Raw) -> bool {
         let keep = match r {
             Raw::Proc { pid, ppid, name, start, .. } => {
                 if *start {
+                    self.names.insert(*pid, name.clone());
                     let by_name = self.target.names.iter().any(|w| crate::spans::name_matches(name, w));
                     let by_parent = self.target.follow_children && self.pids.contains(ppid);
                     if (by_name || by_parent) && Some(*pid) != self.target.exclude_pid {
@@ -74,6 +82,8 @@ impl LiveFilter {
             Raw::Sample { tid, .. } => self.is_tid(*tid),
             // The collector only emits stacks for events this filter kept.
             Raw::Stack { .. } | Raw::Sym { .. } => true,
+            // Produced by the Python sampler for target processes only.
+            Raw::PyStack { .. } => true,
         };
         if keep {
             self.kept += 1;
@@ -103,8 +113,8 @@ mod tests {
         }
         assert!(f.observe(&Raw::CSwitch { ts: 1, new_tid: 110, old_tid: 120, old_state: 1, wait_reason: 0 }));
         assert!(!f.observe(&Raw::CSwitch { ts: 2, new_tid: 120, old_tid: 0, old_state: 1, wait_reason: 0 }));
-        assert!(!f.observe(&Raw::GpuQueueStart { ts: 3, pid: 12, ctx: 1, seq: 1, packet_type: 0 }));
-        assert!(f.observe(&Raw::GpuQueueStart { ts: 3, pid: 11, ctx: 2, seq: 1, packet_type: 0 }));
+        assert!(!f.observe(&Raw::GpuQueueStart { ts: 3, pid: 12, tid: 0, ctx: 1, seq: 1, packet_type: 0 }));
+        assert!(f.observe(&Raw::GpuQueueStart { ts: 3, pid: 11, tid: 0, ctx: 2, seq: 1, packet_type: 0 }));
         assert!(f.observe(&Raw::GpuDmaDone { ts: 4, ctx: 2, seq: 1 }));
         assert!(!f.observe(&Raw::GpuDmaDone { ts: 4, ctx: 1, seq: 1 }));
         assert_eq!(f.target_pids(), &HashSet::from([10, 11]));

@@ -27,6 +27,14 @@ pub fn to_json(a: &Analysis, meta: Value) -> Value {
             if *tid & 0xFFFF == 0xFFFF { "CUDA memcpy".to_string() } else { format!("CUDA stream {}", tid & 0xFFFF) }
         } else if *tid & 0xFFFF_0000 == crate::nsight::CUDA_API_TRACK {
             format!("CUDA API (tid {})", tid & 0xFFFF)
+        } else if *tid & 0xFFFF_0000 == crate::spans::PY_TRACK {
+            match a.py_tracks.get(&(*pid, *tid)) {
+                Some(t) => format!(
+                    "Python: {}",
+                    a.thread_labels.get(&(*pid, *t)).cloned().unwrap_or_else(|| format!("thread {t}"))
+                ),
+                None => "Python".to_string(),
+            }
         } else {
             a.thread_labels.get(&(*pid, *tid)).cloned().unwrap_or_else(|| format!("thread {tid}"))
         };
@@ -66,6 +74,20 @@ pub fn to_json(a: &Analysis, meta: Value) -> Value {
     m.insert("summary".into(), serde_json::to_value(&a.summary).unwrap_or(Value::Null));
     m.insert("unknown_tid_switches".into(), json!(a.unknown_tid_switches));
     m.insert("stacks_in_capture".into(), json!(a.stacks_in_capture));
+    if !a.py_net.is_empty() {
+        let rows: Vec<Value> = a
+            .py_net
+            .iter()
+            .map(|((process, caller, remote), n)| {
+                json!({
+                    "process": process, "caller": caller, "remote": remote,
+                    "sent_bytes": n.sent_bytes, "recv_bytes": n.recv_bytes,
+                    "events": n.events, "matched_by_thread": n.by_thread,
+                })
+            })
+            .collect();
+        m.insert("python_network".into(), json!(rows));
+    }
     json!({ "traceEvents": ev, "displayTimeUnit": "ms", "metadata": Value::Object(m) })
 }
 
@@ -90,7 +112,7 @@ mod tests {
             Raw::Thread { ts: 0, pid: 7, tid: 70, start: true },
             Raw::CSwitch { ts: 10, new_tid: 70, old_tid: 0, old_state: 0, wait_reason: 0 },
             Raw::CSwitch { ts: 30, new_tid: 0, old_tid: 70, old_state: 5, wait_reason: 6 },
-            Raw::Tcp { ts: 40, pid: 7, send: true, bytes: 9, raddr: "1.2.3.4".into(), rport: 443, lport: 1 },
+            Raw::Tcp { ts: 40, pid: 7, tid: 0, send: true, bytes: 9, raddr: "1.2.3.4".into(), rport: 443, lport: 1 },
         ];
         let a = analyze(raw, &Target { pids: vec![7], ..Default::default() });
         let v = to_json(&a, json!({"duration_s": 1}));

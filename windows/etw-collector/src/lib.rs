@@ -3,6 +3,8 @@ pub mod chrome;
 pub mod filter;
 pub mod model;
 pub mod nsight;
+#[cfg(feature = "pyspy")]
+pub mod pysample;
 pub mod spans;
 pub mod stacks;
 #[cfg(windows)]

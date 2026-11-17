@@ -26,12 +26,22 @@ CAPTURE:
                           who woke them; writes <output>.oncpu.folded / .offcpu.folded.
                           Walks a stack on every context switch: 5-30% overhead.
   --stacks=sample         on-CPU sample stacks only (low overhead)
+                          Either mode also shows which code submitted GPU work, from the
+                          sample of the submitting thread nearest each GPU packet:
+                          args.stack on GPU spans, <output>.gpu.folded.
   --symbol-path PATH      DbgHelp search path, e.g.
                           srv*C:\\symbols*https://msdl.microsoft.com/download/symbols
                           (default: _NT_SYMBOL_PATH, else Microsoft's server when the
                           Debugging Tools' dbghelp+symsrv are installed, else exports)
   --symbol-selftest       resolve ntdll/kernel32 functions in this process and report
                           which dbghelp is used and whether PDB download works (no admin)
+  --no-py                 do not sample Python stacks. By default, target processes that
+                          are CPython interpreters are sampled out of process (py-spy,
+                          non-blocking): a Python track per thread, py_stack on blocked
+                          spans, <output>.py.folded / .py-offcpu.folded. No admin needed.
+  --py-rate HZ            Python sampling rate (default 100)
+  --py-selftest PID       sample one Python process for --duration (default 5 s) and print
+                          what was seen; no ETW, works on any OS
   --save-raw PATH         also write the filtered raw event stream (JSON lines)
   --replay PATH           analyse a saved raw stream instead of capturing (any OS)
   --nsys PATH.sqlite      optional: add an Nsight Systems capture (`nsys export -t sqlite`):
@@ -55,6 +65,9 @@ struct Args {
     no_gpu: bool,
     no_net: bool,
     stacks: Option<String>,
+    no_py: bool,
+    py_rate: Option<u32>,
+    py_selftest: Option<u32>,
     symbol_path: Option<String>,
     symbol_selftest: bool,
     save_raw: Option<String>,
@@ -86,6 +99,9 @@ fn parse_args() -> Result<Args> {
                 }
                 a.stacks = Some(m.to_string());
             }
+            "--no-py" => a.no_py = true,
+            "--py-rate" => a.py_rate = Some(val("--py-rate")?.parse().context("--py-rate")?),
+            "--py-selftest" => a.py_selftest = Some(val("--py-selftest")?.parse().context("--py-selftest")?),
             "--symbol-path" => a.symbol_path = Some(val("--symbol-path")?),
             "--symbol-selftest" => a.symbol_selftest = true,
             "--save-raw" => a.save_raw = Some(val("--save-raw")?),
@@ -103,7 +119,9 @@ fn parse_args() -> Result<Args> {
     if a.replay.is_none() {
         a.target.exclude_pid = Some(std::process::id());
     }
-    if a.target.pids.is_empty() && a.target.names.is_empty() && !a.symbol_selftest && a.nsys.is_none() {
+    if a.target.pids.is_empty() && a.target.names.is_empty() && !a.symbol_selftest && a.nsys.is_none()
+        && a.py_selftest.is_none()
+    {
         bail!("specify at least one --pid or --process-name\n\n{USAGE}");
     }
     Ok(a)
@@ -122,8 +140,19 @@ fn load_raw(path: &str) -> Result<Vec<Raw>> {
     Ok(v)
 }
 
+/// Create a file for writing, making its directory if needed, so a typo in
+/// an output path doesn't throw away a finished capture.
+fn create_out(path: &str) -> Result<std::fs::File> {
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create directory {}", dir.display()))?;
+        }
+    }
+    std::fs::File::create(path).with_context(|| format!("create {path}"))
+}
+
 fn save_raw(path: &str, raw: &[Raw]) -> Result<()> {
-    let mut w = BufWriter::new(std::fs::File::create(path).with_context(|| format!("create {path}"))?);
+    let mut w = BufWriter::new(create_out(path)?);
     for r in raw {
         serde_json::to_writer(&mut w, r)?;
         w.write_all(b"\n")?;
@@ -155,6 +184,8 @@ fn capture(a: &Args, meta: &mut serde_json::Map<String, serde_json::Value>) -> R
             Some(_) => etw::StackMode::Full,
         },
         symbol_path: a.symbol_path.clone().or_else(|| std::env::var("_NT_SYMBOL_PATH").ok()),
+        python: !a.no_py && cfg!(feature = "pyspy"),
+        py_rate: a.py_rate.unwrap_or(100),
     };
     eprintln!("capturing{} ... (Ctrl-C to stop)", a.duration.map(|d| format!(" for {:.0}s", d.as_secs_f64())).unwrap_or_default());
     let r = etw::capture(&o, stop)?;
@@ -199,6 +230,7 @@ fn capture(a: &Args, meta: &mut serde_json::Map<String, serde_json::Value>) -> R
     meta.insert("stack_stats".into(), json!(r.stack_stats));
     meta.insert("kernel_session_stats".into(), json!(r.kernel_stats));
     meta.insert("user_session_stats".into(), json!(r.user_stats));
+    meta.insert("python".into(), r.python);
     Ok(r.events)
 }
 
@@ -222,6 +254,9 @@ fn main() -> Result<()> {
         bail!("--symbol-selftest needs Windows");
         #[allow(unreachable_code)]
         return Ok(());
+    }
+    if let Some(pid) = a.py_selftest {
+        return py_selftest(pid, a.duration.unwrap_or(Duration::from_secs(5)), a.py_rate.unwrap_or(100));
     }
     let mut meta = serde_json::Map::new();
     let nsys = match &a.nsys {
@@ -279,7 +314,7 @@ fn main() -> Result<()> {
         eprintln!("warning: no process matched the target; the trace will be empty");
     }
     let doc = chrome::to_json(&analysis, serde_json::Value::Object(meta));
-    let mut w = BufWriter::new(std::fs::File::create(&a.output).with_context(|| format!("create {}", a.output))?);
+    let mut w = BufWriter::new(create_out(&a.output)?);
     serde_json::to_writer(&mut w, &doc)?;
     w.flush()?;
 
@@ -288,12 +323,15 @@ fn main() -> Result<()> {
     for (suffix, folded, unit) in [
         ("oncpu.folded", &analysis.folded_oncpu, "samples"),
         ("offcpu.folded", &analysis.folded_offcpu, "us blocked"),
+        ("gpu.folded", &analysis.folded_gpu, "us of GPU execution, by submitting code path"),
+        ("py.folded", &analysis.folded_py, "samples, wall clock"),
+        ("py-offcpu.folded", &analysis.folded_py_offcpu, "us blocked"),
     ] {
         if folded.is_empty() {
             continue;
         }
         let path = format!("{stem}.{suffix}");
-        let mut w = BufWriter::new(std::fs::File::create(&path).with_context(|| format!("create {path}"))?);
+        let mut w = BufWriter::new(create_out(&path)?);
         for (k, v) in folded {
             writeln!(w, "{k} {v}")?;
         }
@@ -319,6 +357,12 @@ fn main() -> Result<()> {
                 100.0 * s.tracing_overhead_samples as f64 / s.cpu_samples as f64
             );
         }
+        if s.py_thread_samples > 0 {
+            eprintln!(
+                "         python: {} thread samples; {} blocked spans carry a Python stack",
+                s.py_thread_samples, s.blocked_spans_with_py_stack
+            );
+        }
         let mut top: Vec<_> = s.blocked_by_reason_ms.iter().collect();
         top.sort_by(|x, y| y.1.partial_cmp(x.1).unwrap());
         if !top.is_empty() {
@@ -336,6 +380,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Sample one Python process and print what the sampler sees. Exercises
+/// the py-spy path on its own: no ETW, no privileges beyond access to
+/// the process, any OS.
+#[cfg(feature = "pyspy")]
+fn py_selftest(pid: u32, dur: Duration, rate: u32) -> Result<()> {
+    use etw_collector::pysample;
+    use std::collections::BTreeMap;
+    eprintln!("sampling pid {pid} at {rate} Hz for {:.1}s ...", dur.as_secs_f64());
+    let s = pysample::start(Box::new(move || vec![(pid, "python".to_string())]), rate);
+    std::thread::sleep(dur);
+    let r = s.finish();
+    for n in &r.notes {
+        eprintln!("note: {n}");
+    }
+    if r.stats.attached_pids.is_empty() {
+        bail!("could not attach to pid {pid}");
+    }
+    let mut by_thread: BTreeMap<u32, (u64, usize)> = BTreeMap::new();
+    let mut by_stack: BTreeMap<(u32, Vec<String>), u64> = BTreeMap::new();
+    for e in &r.events {
+        if let Raw::PyStack { tid, samples, frames, .. } = e {
+            let t = by_thread.entry(*tid).or_default();
+            t.0 += *samples as u64;
+            t.1 += 1;
+            *by_stack.entry((*tid, frames.clone())).or_default() += *samples as u64;
+        }
+    }
+    for (tid, (n, runs)) in &by_thread {
+        println!("thread {tid}: {n} samples, {runs} distinct stretches");
+    }
+    let mut v: Vec<_> = by_stack.into_iter().collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    println!("\ntop Python stacks (samples; leaf first):");
+    for ((tid, frames), n) in v.iter().take(8) {
+        println!("  {n:>6}  thread {tid}");
+        for f in frames.iter().take(8) {
+            println!("            {f}");
+        }
+    }
+    println!("\n{}", serde_json::to_string_pretty(&r.stats)?);
+    Ok(())
+}
+
+#[cfg(not(feature = "pyspy"))]
+fn py_selftest(_: u32, _: Duration, _: u32) -> Result<()> {
+    bail!("built without the 'pyspy' feature")
+}
+
 /// Top leaf frames by on-CPU samples and top blocking stacks, per process.
 fn print_top(a: &spans::Analysis) {
     use std::collections::BTreeMap;
@@ -350,6 +442,66 @@ fn print_top(a: &spans::Analysis) {
         eprintln!("\non-CPU hot frames (samples, ~1 ms each):");
         for ((p, f), n) in v.iter().take(12) {
             eprintln!("  {n:>6}  {p}  {f}");
+        }
+    }
+    if !a.folded_gpu.is_empty() {
+        let mut v: Vec<_> = a.folded_gpu.iter().collect();
+        v.sort_by(|x, y| y.1.cmp(x.1));
+        let total: u64 = v.iter().map(|x| *x.1).sum();
+        eprintln!("\nGPU work by submitting code path (% of attributed GPU time; innermost named frames first,");
+        eprintln!("driver and syscall frames skipped):");
+        // The full stacks are in <output>.gpu.folded; here, group by the
+        // frames a reader can act on: named ones outside the GPU driver.
+        let mut by_path: std::collections::BTreeMap<(String, String), u64> = std::collections::BTreeMap::new();
+        for (k, us) in &v {
+            let parts: Vec<&str> = k.split(';').collect();
+            let frames: Vec<&str> = parts
+                .iter()
+                .skip(2)
+                .rev()
+                .filter(|f| {
+                    let l = f.to_ascii_lowercase();
+                    f.contains('!')
+                        && !["nvcuda", "win32u.dll", "ntdll.dll", "kernelbase.dll", "nvapi", "nvdxg"].iter().any(|m| l.starts_with(m))
+                })
+                .take(4)
+                .copied()
+                .collect();
+            let path = if frames.is_empty() { "(no named frames)".to_string() } else { frames.join(" <- ") };
+            *by_path.entry((parts[0].to_string(), path)).or_default() += **us;
+        }
+        let mut v: Vec<_> = by_path.iter().collect();
+        v.sort_by(|x, y| y.1.cmp(x.1));
+        for ((proc_, path), us) in v.iter().take(10) {
+            eprintln!("  {:>5.1}%  {}  {}", 100.0 * **us as f64 / total.max(1) as f64, proc_, path);
+        }
+    }
+    if !a.py_net.is_empty() {
+        let mut v: Vec<_> = a.py_net.iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1.sent_bytes + x.1.recv_bytes));
+        eprintln!("\nnetwork by Python caller (bytes out / in, TCP events, remote):");
+        for ((proc_, caller, remote), n) in v.iter().take(10) {
+            eprintln!(
+                "  {:>9} / {:<9} {:>6}  {:<21} {}  {}",
+                n.sent_bytes, n.recv_bytes, n.events, remote, proc_, caller
+            );
+        }
+    }
+    if !a.folded_py_offcpu.is_empty() {
+        let mut v: Vec<_> = a.folded_py_offcpu.iter().collect();
+        v.sort_by(|x, y| y.1.cmp(x.1));
+        eprintln!("\nwhere Python code waited (ms blocked; wait reason, then Python frames innermost first):");
+        for (k, us) in v.iter().take(10) {
+            // key = process;thread;outermost frame;...;innermost frame;[reason]
+            let parts: Vec<&str> = k.split(';').collect();
+            let frames: Vec<&str> = parts.iter().skip(2).rev().take(5).copied().collect();
+            eprintln!(
+                "  {:>9.1}  {} {}  {}",
+                **us as f64 / 1000.0,
+                parts[0],
+                parts.get(1).unwrap_or(&""),
+                frames.join(" <- ")
+            );
         }
     }
     if !a.folded_offcpu.is_empty() {
