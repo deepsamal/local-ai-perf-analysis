@@ -5,16 +5,18 @@ Snapshot of what the tool currently captures vs. what it misses,
 measured against a fixed synthetic agent workload.
 
 **Trace source:** `/tmp/synthetic_trace.json`
-**Trace events:** 101 total, 101 non-metadata
+**Trace events:** 16506 total, 16485 non-metadata
 **Iterations:** 10
 
 ## Captured
 
-- Categories: `['gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer']`
+- Categories: `['cpu', 'cpu_off', 'cpu_runq', 'disk', 'gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer', 'net', 'net_wait', 'subprocess']`
 - GPU events: 101
-- CPU events: 0
-- Stack arrays attempted: 71
-- Stack arrays non-empty (blazesym resolved): 0
+- CPU events: 11311
+- Stack arrays attempted: 1291
+- Stack arrays non-empty (blazesym resolved): 307
+- Stack lookups failed (stack map problem): 0
+- Stacks found but unsymbolized (blazesym/pid problem): 983
 
 ## Per-phase assertion status
 
@@ -22,45 +24,55 @@ measured against a fixed synthetic agent workload.
 
 | Status | Assertion | Detail |
 |---|---|---|
-| PASS | trace contains events | 101 non-metadata events |
-| PASS | trace has GPU compute category | categories seen: ['gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer'] |
+| PASS | trace contains events | 16485 non-metadata events |
+| PASS | trace has GPU compute category | categories seen: ['cpu', 'cpu_off', 'cpu_runq', 'disk', 'gpu_compute', 'gpu_mem', 'gpu_sync', 'gpu_xfer', 'net', 'net_wait', 'subprocess'] |
 | PASS | trace has at least 20 GPU events | counted 101 gpu events |
-| PASS | trace has stack arrays | 71 events have a 'stack' key |
-| FAIL | stack arrays are non-empty (blazesym resolved frames) | 0/71 resolved |
+| PASS | trace has stack arrays | 1291 events have a 'stack' key |
+| PASS | stack arrays are non-empty (blazesym resolved frames) | 307/1291 resolved (0 lookup_failed, 983 symbolize_failed) |
 
 ### Phase 1 — network
 
 | Status | Assertion | Detail |
 |---|---|---|
-| PEND | trace has 'net' category events | requires Phase 1 (network probes) |
-| PEND | search_tool() calls captured as network events | requires Phase 1 (network probes) |
-| PEND | network event stacks include synthetic_agent.py | requires Phase 1 (network probes) |
+| PASS | trace has 'net' category events | 31 events |
+| PASS | search_tool() calls captured as request/response pairs | 10 await-response spans (expected 10); 10 sends, 11 recvs to :8765 |
+| PASS | network wait matches iterations x server latency (within 20%) | measured 1508 ms vs expected 1500 ms (+0.6%) |
+| PASS | peer identified as loopback | 21/21 calls flagged loopback |
+| PASS | network stacks resolve to symbols | 20/20 stacks resolved (20 events) |
+| FAIL | network stacks include search_tool() / agent.py | 0/20 stacks name the agent's Python code -- native frames only; Python frames need a frame-pointer build of CPython plus -X perf (docs/PYTHON_ATTRIBUTION.md) |
 
 ### Phase 2 — subprocess
 
 | Status | Assertion | Detail |
 |---|---|---|
-| PEND | trace has 'subprocess' category events | requires Phase 2 (subprocess probes) |
-| PEND | run_code_tool() spawns captured as fork/exec events | requires Phase 2 |
-| PEND | subprocess events include wait4 duration | requires Phase 2 |
+| PASS | trace has 'subprocess' category events | 12 events |
+| PASS | run_code_tool() spawns captured as fork + exec | 4 children of the agent (expected 4), 4 exec'd a python interpreter |
+| PASS | subprocess lifetime matches the snippet's sleep | lifetimes 136, 417, 223, 531 ms vs sleeps 100, 400, 200, 500 ms (+0..400 ms start-up) |
+| PASS | every spawned child is reaped by a captured wait | 4/4 children reaped; the reaping wait itself took 0.18 ms at most -- subprocess.run() blocks on the child's pipes and only then calls wait4, so the stall is the lifetime span, not wait4 |
+| PASS | subprocess stacks resolve to symbols | 4/4 stacks resolved (4 events) |
+| FAIL | subprocess stacks include run_code_tool() / agent.py | 0/4 stacks name the agent's Python code -- native frames only; Python frames need a frame-pointer build of CPython plus -X perf (docs/PYTHON_ATTRIBUTION.md) |
 
 ### Phase 3 — disk
 
 | Status | Assertion | Detail |
 |---|---|---|
-| PEND | trace has 'disk' category events | requires Phase 3 (disk probes) |
-| PEND | read_documents() reads captured with path attribution | requires Phase 3 |
+| PASS | trace has 'disk' category events | 1287 events |
+| PASS | read_documents() reads captured with path attribution | 30 reads under the corpus (expected >= 30); 20/20 expected documents seen |
+| PASS | path resolution succeeded on >= 80% of file events | 232/235 agent file events have an absolute path (99%) |
+| PASS | disk stacks resolve to symbols | 10/10 stacks resolved (30 events) |
+| FAIL | disk stacks include read_documents() / agent.py | 0/10 stacks name the agent's Python code -- native frames only; Python frames need a frame-pointer build of CPython plus -X perf (docs/PYTHON_ATTRIBUTION.md) |
 
 ## Estimated agent wall-clock attribution
 
 Synthetic numbers (the agent is deterministic so we can predict the budget):
 
-| Bottleneck class | Estimated time | Visible today? |
-|---|---|---|
-| gpu | ~200 ms | ✅ yes |
-| network | ~1500 ms | ❌ no — see roadmap |
-| subprocess | ~1200 ms | ❌ no — see roadmap |
-| disk | ~4 ms | ❌ no — see roadmap |
+| Bottleneck class | Estimated time | Visible today? | Measured in this trace |
+|---|---|---|---|
+| gpu | ~200 ms | ✅ yes | — |
+| network | ~1500 ms | ✅ yes | 1508.4 ms |
+| subprocess | ~1200 ms | ✅ yes | 1307.0 ms |
+| disk | ~4 ms | ✅ yes | 18.6 ms |
 
-**Current visibility: ~7% of estimated agent wall-clock.**
-The remaining ~93% lives in bottleneck classes the tool doesn't yet instrument — see [ROADMAP.md](ROADMAP.md) Phases 1–3.
+**Current visibility: ~100% of estimated agent wall-clock.**
+
+Network is the time from the last byte of each request to the first byte of its reply; subprocess is fork-to-exit lifetime; disk is time inside `vfs_read` on the corpus files (page-cache hits included).

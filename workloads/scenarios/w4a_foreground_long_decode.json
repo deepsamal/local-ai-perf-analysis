@@ -1,0 +1,16 @@
+{
+  "name": "w4a_foreground_long_decode",
+  "description": "Baseline for w4b. One foreground agent decoding 256-token replies on short prompts, no interference. ITL p99 here is the reference the contended run is compared against.",
+  "seed": 0,
+  "defaults": {"temperature": 0.0, "seed": 0},
+  "agents": [
+    {
+      "name": "fg", "role": "foreground",
+      "system_tokens": 100, "history": false, "loop": 10,
+      "steps": [
+        {"do": "chat", "label": "long-decode", "prompt_tokens": 48, "max_tokens": 256},
+        {"do": "sleep", "seconds": 1}
+      ]
+    }
+  ]
+}

@@ -21,7 +21,11 @@ BIN="$REPO_ROOT/bin/unified_trace"
 
 # Tunables (env-overridable so the same script works during dev and CI).
 AGENT_ITERS="${AGENT_ITERS:-10}"
-AGENT_WARMUP_S="${AGENT_WARMUP_S:-3}"
+# The agent sleeps this long after printing its pid so the tracer can
+# finish attaching first. 3 s stopped being enough once the tracer grew
+# to five BPF objects: the first search request went out mid-attach and
+# was caught only on its receive side.
+AGENT_WARMUP_S="${AGENT_WARMUP_S:-8}"
 SEARCH_LATENCY_MS="${SEARCH_LATENCY_MS:-150}"
 DURATION="${DURATION:-25}"
 OUT="${OUT:-/tmp/synthetic_trace.json}"
@@ -68,6 +72,24 @@ fi
 # Also nuke any orphaned synthetic_agent processes from prior runs.
 pkill -f 'synthetic_agent/server.py' 2>/dev/null || true
 pkill -f 'synthetic_agent/agent.py' 2>/dev/null || true
+
+# Stop a process without ever blocking indefinitely: TERM, poll up to
+# ~3 s, then KILL. A bare `wait` on the sudo wrappers could hang forever
+# (sudo with use_pty doesn't always exit after its child is killed), which
+# left the harness stuck after "tracer done". Reaps with a background-safe
+# `wait` only once the pid is gone.
+stop_pid() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in {1..30}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
 
 # Always-on cleanup so Ctrl+C, errors, etc. don't leak processes.
 # Set this BEFORE we start spawning subprocesses; the trap captures
@@ -164,7 +186,12 @@ fi
 # ----- 5. tracer (system-wide because the --pid filter has known issues
 # we deferred to a follow-up — see ROADMAP / project_status memory).
 echo "=== starting tracer (duration=${DURATION}s) ==="
-"$BIN" "${CUDA_ARG[@]}" --duration "$DURATION" --output "$OUT" \
+# Scheduling and CUDA stay system-wide; the network / subprocess / disk
+# probes follow the agent's process tree (the agent and the tools it
+# spawns), which is what --io-pid selects.
+IO_ARG=()
+[[ -n "$REAL_AGENT_PID" ]] && IO_ARG=(--io-pid "$REAL_AGENT_PID")
+"$BIN" "${CUDA_ARG[@]}" "${IO_ARG[@]}" --duration "$DURATION" --output "$OUT" \
        --stack-sample-async 4 --stack-sample-sync 1 &
 TRACER_PID=$!
 
@@ -174,18 +201,11 @@ wait "$TRACER_PID" 2>/dev/null || true
 
 # ----- 6. cleanup
 echo "=== tracer done; killing agent + server ==="
-if [[ -n "$REAL_AGENT_PID" ]] && kill -0 "$REAL_AGENT_PID" 2>/dev/null; then
-    kill -TERM "$REAL_AGENT_PID" 2>/dev/null || true
-    for _ in {1..20}; do
-        kill -0 "$REAL_AGENT_PID" 2>/dev/null || break
-        sleep 0.1
-    done
-    kill -KILL "$REAL_AGENT_PID" 2>/dev/null || true
-fi
-kill -TERM "$AGENT_PID_WRAPPER" 2>/dev/null || true
-wait "$AGENT_PID_WRAPPER" 2>/dev/null || true
-kill -TERM "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
+stop_pid "$REAL_AGENT_PID"
+stop_pid "$AGENT_PID_WRAPPER"
+stop_pid "$SEARCH_PID"
+stop_pid "$SERVER_PID"
+echo "=== agent + server stopped ==="
 
 # Show the agent's progress for context
 echo
@@ -194,6 +214,10 @@ grep '^AGENT_' /tmp/syn_agent.out || true
 
 # ----- 7. validate + state report
 echo
+AGENT_PID_ARG=()
+[[ -n "$REAL_AGENT_PID" ]] && AGENT_PID_ARG=(--agent-pid "$REAL_AGENT_PID")
 "$PYBIN" "$HERE/validate.py" "$OUT" \
     --iters "$AGENT_ITERS" \
+    --latency-ms "$SEARCH_LATENCY_MS" \
+    "${AGENT_PID_ARG[@]}" \
     --write-report "$REPORT"

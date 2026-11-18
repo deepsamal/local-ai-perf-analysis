@@ -1,0 +1,19 @@
+{
+  "name": "w2a_foreground_solo",
+  "description": "Baseline for w2b. An interactive agent sends a short prompt every few seconds with a growing conversation, alone on the machine. Its TTFT distribution is the reference the contended run is compared against.",
+  "seed": 0,
+  "defaults": {"temperature": 0.0, "seed": 0},
+  "agents": [
+    {
+      "name": "fg",
+      "role": "foreground",
+      "system_tokens": 200,
+      "history": true,
+      "loop": 10,
+      "steps": [
+        {"do": "chat", "label": "interactive", "prompt_tokens": 48, "max_tokens": 48},
+        {"do": "sleep", "seconds": 3}
+      ]
+    }
+  ]
+}

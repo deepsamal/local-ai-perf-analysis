@@ -1,0 +1,41 @@
+[package]
+name = "etw-collector"
+version = "0.1.0"
+edition = "2021"
+description = "ETW collector for local-ai-perf-analysis: CPU scheduling, GPU execution, TCP and hard faults of AI agents on Windows, emitted as Chrome Tracing JSON"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+cpp_demangle = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# Out-of-process Python stack sampling (src/pysample.rs). Library only: no
+# native unwinding, so none of py-spy's libunwind dependency.
+py-spy = { version = "0.4", default-features = false, optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = ["nsight", "pyspy"]
+# Python frames for target processes that are CPython interpreters.
+# `--no-default-features --features nsight` builds without it.
+pyspy = ["dep:py-spy"]
+# Optional co-analysis of `nsys export -t sqlite` files (--nsys).
+nsight = ["dep:rusqlite"]
+
+[target.'cfg(windows)'.dependencies]
+ferrisetw = "1.2"
+ctrlc = "3"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_LibraryLoader",
+] }
+
+[profile.release]
+debug = 1

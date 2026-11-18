@@ -1,0 +1,28 @@
+{
+  "name": "w0_single_request_sweep",
+  "description": "Calibration. One agent, one request at a time, nothing else running. Gives model load time, prefill rate by prompt length, prompt-cache hit cost and decode rate by output length: the baselines every other workload is compared against. Largest prompt is ~2k tokens so it fits a 4096-token context; raise the server's context length before adding larger sizes.",
+  "seed": 0,
+  "defaults": {"temperature": 0.0, "seed": 0, "max_tokens": 32},
+  "agents": [
+    {
+      "name": "solo",
+      "role": "foreground",
+      "system_tokens": 32,
+      "history": false,
+      "steps": [
+        {"do": "unload", "settle_s": 3},
+        {"do": "chat", "label": "cold-load", "cache": "cold", "prompt_tokens": 64, "max_tokens": 16},
+
+        {"do": "chat", "label": "prefill-256", "cache": "cold", "prompt_tokens": 256, "repeat": 3},
+        {"do": "chat", "label": "prefill-1024", "cache": "cold", "prompt_tokens": 1024, "repeat": 3},
+        {"do": "chat", "label": "prefill-2048", "cache": "cold", "prompt_tokens": 2048, "repeat": 3},
+
+        {"do": "chat", "label": "cache-miss-2048", "cache": "warm", "prompt_tokens": 2048, "prompt_seed": "hit"},
+        {"do": "chat", "label": "cache-hit-2048", "cache": "warm", "prompt_tokens": 2048, "prompt_seed": "hit", "repeat": 3},
+
+        {"do": "chat", "label": "decode-64", "cache": "cold", "prompt_tokens": 64, "max_tokens": 64, "repeat": 3},
+        {"do": "chat", "label": "decode-256", "cache": "cold", "prompt_tokens": 64, "max_tokens": 256, "repeat": 3}
+      ]
+    }
+  ]
+}

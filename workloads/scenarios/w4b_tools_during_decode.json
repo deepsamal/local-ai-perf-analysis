@@ -1,0 +1,30 @@
+{
+  "name": "w4b_tools_during_decode",
+  "description": "Foreground agent decoding 256-token replies while a background agent runs real tool steps that compete for CPU and disk (findstr across a source tree, a Python disk+CPU hog). The server processes keep the GPU, but their token loop is scheduled on the CPU, so a saturated CPU shows up as a drop in decode tok/s and a rise in ITL p99. On an elevated trace the collector's prefill_runq_ms / decode_runq_ms (runnable-but-waiting) in each request window attributes the slowdown to CPU starvation. Note: tool steps use the CMD shell; keep commands read-only and short. The hog script lives in workloads\\hogs\\ and only writes to the system temp dir.",
+  "seed": 0,
+  "defaults": {"temperature": 0.0, "seed": 0},
+  "agents": [
+    {
+      "name": "fg", "role": "foreground",
+      "system_tokens": 100, "history": false, "loop": 10,
+      "steps": [
+        {"do": "chat", "label": "long-decode", "prompt_tokens": 48, "max_tokens": 256},
+        {"do": "sleep", "seconds": 1}
+      ]
+    },
+    {
+      "name": "bg", "role": "background",
+      "start_delay_s": 1.5,
+      "history": false, "loop": 100,
+      "steps": [
+        {"do": "tool", "label": "findstr-todo",
+         "cmd": "findstr /s /i /m TODO *.c *.h *.py *.rs *.md *.ps1 *.sh",
+         "cwd": ".", "timeout_s": 60},
+        {"do": "tool", "label": "cpu-disk-hog",
+         "cmd": "python workloads\\hogs\\cpu_disk_loop.py --duration 6 --size-mib 32 --disk-threads 2 --cpu-threads 4",
+         "cwd": ".", "timeout_s": 30},
+        {"do": "sleep", "seconds": 0.2}
+      ]
+    }
+  ]
+}

@@ -21,6 +21,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "maps.h"
+#include "pidns.h" /* pid-namespace translation */
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -41,9 +42,17 @@ struct {
     __type(value, struct cuda_call_info);
 } cuda_calls SEC(".maps");
 
+/* --verbose: last pid-chain snapshot of a CUDA-calling task. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct pidns_dbg);
+} pidns_debug SEC(".maps");
+
 /* Per-cpu counter used to decide whether to capture a stack on this
  * uprobe fire. Indexed by 0; we keep one slot. Sample period is set
- * from user space via .rodata at load time.
+ * from the cuda_cfg map at runtime.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -52,27 +61,38 @@ struct {
     __type(value, __u64);
 } stack_sample_counter SEC(".maps");
 
-/* User-tunable knobs. Set via libbpf .rodata before bpf_object__load().
- *
- * We use a single struct here (not individual `const volatile` globals)
- * specifically because clang for BPF is free to reorder separately-
- * declared globals by size for tighter .rodata packing. The struct
- * forces a deterministic layout that user-space can mirror exactly.
- * The same struct definition lives in unified_trace.c.
+/* User-tunable knobs, read from the cuda_cfg map below. The same struct
+ * definition is mirrored in unified_trace.c; keep them in sync.
  */
 struct cuda_tracer_cfg {
     __u32 target_pid;            /* 0 = all PIDs */
     __u32 sample_period_sync;    /* sync calls: every Nth event captures stack */
     __u32 sample_period_async;   /* async calls: every Nth event captures stack */
     __u8  capture_stacks;        /* 0 = disable stack capture entirely */
-    __u8  _pad[3];
+    __u8  debug_pidns;           /* --verbose: snapshot one task's pid chain */
+    __u8  _pad[2];
+    __u32 pidns_inum;            /* tracer's pid-namespace inode; 0 = no translation */
+    __u32 _pad2;
+    __u64 pidns_dev;             /* st_dev of that nsfs file (for the helper) */
 };
-const volatile struct cuda_tracer_cfg cfg = {
-    .target_pid          = 0,
-    .sample_period_sync  = 1,
-    .sample_period_async = 8,
-    .capture_stacks      = 1,
-};
+/* Config lives in a one-entry array map that user space fills after load
+ * and before attach -- NOT in `const volatile` .rodata. clang 10 (the
+ * default on Ubuntu 20.04 / older WSL distros) constant-folds const
+ * volatile struct members to their initializers, silently ignoring every
+ * knob user space set (pid filter, sampling, pid namespace). A runtime
+ * map lookup cannot be folded. All-zero (not yet written) = defaults. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct cuda_tracer_cfg);
+} cuda_cfg SEC(".maps");
+
+static __always_inline struct cuda_tracer_cfg *get_cfg(void)
+{
+    __u32 k = 0;
+    return bpf_map_lookup_elem(&cuda_cfg, &k);
+}
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -81,9 +101,10 @@ const volatile struct cuda_tracer_cfg cfg = {
 /* Decide if we should capture a stack on this entry probe. Per-cpu
  * counter keeps overhead bounded; period is per-op-class (async vs sync).
  */
-static __always_inline __s32 maybe_capture_stack(struct pt_regs *ctx, __u32 flags)
+static __always_inline __s32 maybe_capture_stack(struct pt_regs *ctx, __u32 flags,
+                                                  struct cuda_tracer_cfg *cfgp)
 {
-    if (!cfg.capture_stacks)
+    if (!cfgp->capture_stacks)
         return -1;
 
     __u32 key = 0;
@@ -91,8 +112,8 @@ static __always_inline __s32 maybe_capture_stack(struct pt_regs *ctx, __u32 flag
     if (!cnt)
         return -1;
 
-    __u32 period = (flags & CUDA_EV_FLAG_ASYNC) ? cfg.sample_period_async
-                                                : cfg.sample_period_sync;
+    __u32 period = (flags & CUDA_EV_FLAG_ASYNC) ? cfgp->sample_period_async
+                                                : cfgp->sample_period_sync;
     if (period == 0)
         period = 1;
 
@@ -112,22 +133,34 @@ static __always_inline int record_entry(struct pt_regs *ctx,
                                         __u32 op_type, __u32 flags,
                                         __u64 size, __u64 ptr, __u64 stream_id)
 {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
-
-    if (cfg.target_pid != 0 && pid != cfg.target_pid)
+    struct cuda_tracer_cfg *cfgp = get_cfg();
+    if (!cfgp)
         return 1;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();   /* root-ns; map key only */
+    __u32 pid, tid;
+    current_ids_ns(cfgp->pidns_dev, cfgp->pidns_inum, &pid, &tid);
+
+    if (cfgp->target_pid != 0 && pid != cfgp->target_pid)
+        return 1;
+
+    if (cfgp->debug_pidns) {
+        __u32 k0 = 0;
+        struct pidns_dbg *d = bpf_map_lookup_elem(&pidns_debug, &k0);
+        if (d)
+            pidns_snapshot(d, cfgp->pidns_dev, cfgp->pidns_inum);
+    }
 
     struct cuda_call_info info = {};
     info.timestamp = bpf_ktime_get_ns();
     info.op_type = op_type;
     info.pid = pid;
+    info.tid = tid;
     info.size = size;
     info.ptr = ptr;
     info.stream_id = stream_id;
     info.flags = flags;
 
-    __s32 sid = maybe_capture_stack(ctx, flags);
+    __s32 sid = maybe_capture_stack(ctx, flags, cfgp);
     info.stack_id = sid;
     if (sid >= 0)
         info.flags |= CUDA_EV_FLAG_STACK_SAMPLED;
@@ -164,7 +197,7 @@ static __always_inline int submit_event(struct pt_regs *ctx, __u32 op_type)
     event->timestamp = info->timestamp;
     event->duration_ns = end_time - info->timestamp;
     event->pid = info->pid;
-    event->tid = pid_tgid & 0xFFFFFFFF;
+    event->tid = info->tid;
     event->op_type = op_type;
     event->size = info->size;
     event->ptr = info->ptr;

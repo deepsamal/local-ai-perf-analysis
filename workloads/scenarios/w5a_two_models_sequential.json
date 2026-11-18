@@ -1,0 +1,28 @@
+{
+  "name": "w5a_two_models_sequential",
+  "description": "One agent alternating between a small and a large model, serial requests, three alternations. Needs OLLAMA_MAX_LOADED_MODELS=1 (so only one fits at a time) or two models whose combined VRAM exceeds the GPU. With MAX_LOADED_MODELS=1 every model switch costs a full model load, which shows up as TTFT = load_time + prefill. cache: cold on every step so no prompt cache can hide the load. Expected: TTFT on a switch is close to the cold-load numbers in `RESULTS.md` (~1.8 s for 0.5b, ~12 s for 7b on this host); the second request on the same model is at the steady-state cost.",
+  "seed": 0,
+  "defaults": {"temperature": 0.0, "seed": 0, "max_tokens": 16},
+  "agents": [
+    {
+      "name": "alt", "role": "foreground",
+      "system_tokens": 32, "history": false,
+      "steps": [
+        {"do": "chat", "label": "small-first",  "model": "qwen2.5:0.5b",               "cache": "cold", "prompt_tokens": 64},
+        {"do": "chat", "label": "small-again",  "model": "qwen2.5:0.5b",               "cache": "cold", "prompt_tokens": 64},
+
+        {"do": "chat", "label": "large-switch", "model": "qwen2.5:7b-instruct-q4_K_M", "cache": "cold", "prompt_tokens": 64},
+        {"do": "chat", "label": "large-again",  "model": "qwen2.5:7b-instruct-q4_K_M", "cache": "cold", "prompt_tokens": 64},
+
+        {"do": "chat", "label": "small-switch", "model": "qwen2.5:0.5b",               "cache": "cold", "prompt_tokens": 64},
+        {"do": "chat", "label": "small-again",  "model": "qwen2.5:0.5b",               "cache": "cold", "prompt_tokens": 64},
+
+        {"do": "chat", "label": "large-switch", "model": "qwen2.5:7b-instruct-q4_K_M", "cache": "cold", "prompt_tokens": 64},
+        {"do": "chat", "label": "large-again",  "model": "qwen2.5:7b-instruct-q4_K_M", "cache": "cold", "prompt_tokens": 64},
+
+        {"do": "chat", "label": "small-switch", "model": "qwen2.5:0.5b",               "cache": "cold", "prompt_tokens": 64},
+        {"do": "chat", "label": "small-again",  "model": "qwen2.5:0.5b",               "cache": "cold", "prompt_tokens": 64}
+      ]
+    }
+  ]
+}
