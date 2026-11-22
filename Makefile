@@ -16,7 +16,16 @@
 #   * cargo / rustc      — build blazesym wrapper (optional; falls back
 #                           to lib+offset resolution if absent)
 
-CLANG   ?= clang
+# Prefer the newest clang installed. clang 10 (Ubuntu 20.04's default,
+# still common in WSL distros) miscompiles BPF this project relies on:
+# it dropped stores into ringbuf records and constant-folded const
+# volatile config structs. The code now avoids both patterns, but a
+# modern clang is strongly recommended.
+CLANG   ?= $(shell for c in clang-19 clang-18 clang-17 clang-16 clang-15 clang-14 clang-13 clang-12 clang; do command -v $$c >/dev/null 2>&1 && { echo $$c; break; }; done)
+CLANG_MAJOR := $(shell $(CLANG) -dumpversion 2>/dev/null | cut -d. -f1)
+ifeq ($(shell test "$(CLANG_MAJOR)" -lt 12 2>/dev/null && echo old),old)
+$(warning $(CLANG) is version $(CLANG_MAJOR); >= 12 recommended for BPF. On Ubuntu: sudo apt-get install clang-14, then make clean all)
+endif
 LLC     ?= llc
 CC      ?= gcc
 CARGO   ?= cargo
@@ -69,7 +78,7 @@ dirs:
 
 # ---------- BPF programs ----------
 
-$(OBJ_DIR)/%.bpf.o: $(BPF_DIR)/%.bpf.c $(INC_DIR)/common.h $(INC_DIR)/maps.h
+$(OBJ_DIR)/%.bpf.o: $(BPF_DIR)/%.bpf.c $(INC_DIR)/common.h $(INC_DIR)/maps.h $(INC_DIR)/pidns.h $(INC_DIR)/io_common.h
 	$(CLANG) $(CLANG_FLAGS) -c $< -o $@
 
 # ---------- blazesym wrapper (Rust) ----------
@@ -92,6 +101,15 @@ endif
 $(BIN_DIR)/%: $(USER_DIR)/%.c $(INC_DIR)/common.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Network / subprocess / disk probes (roadmap Phases 1-3): three BPF
+# objects loaded by unified_trace at run time, plus the header-only
+# user-space half that unified_trace.c includes.
+IO_DEPS := $(OBJ_DIR)/trace_net.bpf.o \
+           $(OBJ_DIR)/trace_process.bpf.o \
+           $(OBJ_DIR)/trace_disk.bpf.o \
+           $(USER_DIR)/io_trace.h \
+           $(INC_DIR)/io_common.h
+
 # unified_trace links the blazesym archive when available. Falling
 # back to a stub keeps the build succeeding in environments without
 # Rust; the C side has runtime null-checks for symbolizer == NULL.
@@ -99,6 +117,7 @@ ifdef HAVE_CARGO
 $(BIN_DIR)/unified_trace: $(USER_DIR)/unified_trace.c \
                           $(OBJ_DIR)/trace_cpu_sched.bpf.o \
                           $(OBJ_DIR)/trace_cuda.bpf.o \
+                          $(IO_DEPS) \
                           $(BLAZESYM_LIB) \
                           $(SYM_DIR)/blazesym_wrap.h \
                           $(INC_DIR)/common.h
@@ -120,6 +139,7 @@ $(OBJ_DIR)/blazesym_stub.o: $(SYM_DIR)/blazesym_wrap.h
 $(BIN_DIR)/unified_trace: $(USER_DIR)/unified_trace.c \
                           $(OBJ_DIR)/trace_cpu_sched.bpf.o \
                           $(OBJ_DIR)/trace_cuda.bpf.o \
+                          $(IO_DEPS) \
                           $(OBJ_DIR)/blazesym_stub.o \
                           $(SYM_DIR)/blazesym_wrap.h \
                           $(INC_DIR)/common.h

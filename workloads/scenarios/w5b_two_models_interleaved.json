@@ -1,0 +1,28 @@
+{
+  "name": "w5b_two_models_interleaved",
+  "description": "Two agents pinned to different models (0.5b and 7b) running concurrently. With OLLAMA_MAX_LOADED_MODELS=1 (or two models whose combined VRAM exceeds the GPU) every alternation forces an unload+load; under contention the small agent pays the large model's load cost on every one of its turns and vice versa. Compare to w5a (sequential): w5a amortises the load over consecutive same-model requests; w5b never gets that chance. The small-model agent's TTFT is the headline: it should go from ~40 ms (w0) to seconds per request. GPU sidecar samples show the VRAM used dropping to zero briefly on every swap.",
+  "seed": 0,
+  "defaults": {"temperature": 0.0, "seed": 0, "max_tokens": 16},
+  "agents": [
+    {
+      "name": "small", "role": "foreground",
+      "model": "qwen2.5:0.5b",
+      "system_tokens": 32, "history": false,
+      "start_delay_s": 0.0, "loop": 6,
+      "steps": [
+        {"do": "chat", "label": "small-turn", "cache": "cold", "prompt_tokens": 64},
+        {"do": "sleep", "seconds": 1.0}
+      ]
+    },
+    {
+      "name": "large", "role": "foreground",
+      "model": "qwen2.5:7b-instruct-q4_K_M",
+      "system_tokens": 32, "history": false,
+      "start_delay_s": 0.5, "loop": 6,
+      "steps": [
+        {"do": "chat", "label": "large-turn", "cache": "cold", "prompt_tokens": 64},
+        {"do": "sleep", "seconds": 1.0}
+      ]
+    }
+  ]
+}

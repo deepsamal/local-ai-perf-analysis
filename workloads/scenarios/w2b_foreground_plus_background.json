@@ -1,0 +1,51 @@
+{
+  "name": "w2b_foreground_plus_background",
+  "description": "Head-of-line blocking. Same interactive agent as w2a, plus a background agent that keeps submitting ~2k-token uncached prompts (an indexer or mail parser). Compare the foreground TTFT p50/p95/max with w2a. Run once per server concurrency setting (e.g. OLLAMA_NUM_PARALLEL=1 and =2): with one slot the foreground queues behind the prefill and loses its prompt cache; with two it shares the GPU instead.",
+  "seed": 0,
+  "defaults": {
+    "temperature": 0.0,
+    "seed": 0
+  },
+  "agents": [
+    {
+      "name": "fg",
+      "role": "foreground",
+      "system_tokens": 200,
+      "history": true,
+      "loop": 10,
+      "steps": [
+        {
+          "do": "chat",
+          "label": "interactive",
+          "prompt_tokens": 48,
+          "max_tokens": 48
+        },
+        {
+          "do": "sleep",
+          "seconds": 3
+        }
+      ]
+    },
+    {
+      "name": "bg",
+      "role": "background",
+      "start_delay_s": 1.5,
+      "system_tokens": 200,
+      "history": false,
+      "loop": 100000,
+      "steps": [
+        {
+          "do": "chat",
+          "label": "bulk-prefill",
+          "cache": "cold",
+          "prompt_tokens": 2048,
+          "max_tokens": 64
+        },
+        {
+          "do": "sleep",
+          "seconds": 1
+        }
+      ]
+    }
+  ]
+}

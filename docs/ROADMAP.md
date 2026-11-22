@@ -19,12 +19,24 @@ The roadmap is structured so each phase lands an honest, validatable claim. Prog
 - Python frame attribution on WSL2 + cu126 torch (PID mismatch — under investigation; works in principle, broken in our specific stack)
 - CPU sched ↔ GPU correlation for the agent PID specifically (filter doesn't always apply — works system-wide)
 
-**Missing entirely:**
-- Network bottleneck visibility (tool API calls, remote LLMs, vector DBs)
-- Disk bottleneck visibility (RAG retrieval, file tools)
-- Subprocess bottleneck visibility (code interpreters, shell tools, browser automation)
+**Landed 2026-11-15 (Phases 1–3, Linux/eBPF):**
+- Network: `trace_net.bpf.c`, see [PROBES_NETWORK.md](PROBES_NETWORK.md)
+- Subprocess: `trace_process.bpf.c`, see [PROBES_SUBPROCESS.md](PROBES_SUBPROCESS.md)
+- Disk: `trace_disk.bpf.c`, see [PROBES_DISK.md](PROBES_DISK.md)
 
-The last three gaps are the gap between "useful CUDA tracer" and "honest agent perf analyzer." Closing them is the point of this roadmap.
+On the synthetic agent (WSL2, kernel 6.18, GTX 1080) the validator passes 19 of 22 assertions; [STATE_REPORT.md](STATE_REPORT.md) has the run. Timing, peers, paths and the process tree are all there. The three failures are one gap: **no stack reaches the agent's Python code**. Stacks stop at the first libc or CPython frame because the interpreter on the test box (pyenv 3.12.7) is built without frame pointers. This is the same gap Phase 0 has for CUDA stacks, and it now blocks the "stack includes `search_tool`" style criteria in every phase.
+
+**Where the implementation departs from the plan below:**
+- Network wait is reported as `await response` (last request byte to first reply byte), not as `tcp_recvmsg` duration. Clients that wait in `poll`/`epoll` spend microseconds in `tcp_recvmsg`.
+- Subprocess stall is the fork-to-exit lifetime span. `wait4` returns immediately under `subprocess.run()`, which blocks on the child's pipes first.
+- `wait4`/`waitid` are caught with the raw `sys_enter`/`sys_exit` tracepoints rather than a kprobe pair.
+- Disk paths come from the dentry chain in the kernel, not from `/proc/<pid>/fd`.
+- Net and disk use fentry/fexit when the kernel allows and fall back to kprobes.
+- Children of the traced process are followed, so a tool's own network and disk activity is recorded.
+
+**Not done:**
+- Windows parity. `etw-collector` already has TCP send/recv; it has no subprocess lifetime spans and no file I/O.
+- Phase 1–3 probes have run only on WSL2 x86-64. The no-CUDA path of `unified_trace` (new: a missing libcudart is no longer fatal) has not been exercised.
 
 ---
 

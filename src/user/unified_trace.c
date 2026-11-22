@@ -7,9 +7,13 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include <stdarg.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "common.h"
+#include "maps.h"
 #include "blazesym_wrap.h"
 
 static volatile bool exiting = false;
@@ -26,6 +30,26 @@ static bsw_symbolizer_t *symbolizer = NULL;
 static int symbolize_enabled = 1;
 static int max_stack_frames_in_json = 12; /* truncate JSON stacks to keep file size bounded */
 
+/* libbpf log verbosity: warnings/info always shown, debug (verifier log
+ * etc.) only with --verbose. libbpf output used to be silenced entirely,
+ * which is why load failures showed up as a bare "-22".
+ */
+static int verbose = 0;
+/* Set around load attempts that are expected to fail on some kernels
+ * (the fentry probe set in io_trace.h) so the fallback isn't preceded by
+ * a page of libbpf warnings. --verbose overrides it. */
+static int libbpf_quiet = 0;
+
+/* Stack-emission outcome counters, printed at exit and written into the
+ * JSON metadata so "why are my stacks empty?" is answerable from the
+ * trace itself. */
+static int stacks_ok = 0;              /* blazesym returned >= 1 frame */
+static int stacks_lookup_failed = 0;   /* stack_id not found in stack map */
+static int stacks_symbolize_failed = 0;/* addrs found, blazesym returned 0 frames */
+static int stacks_raw = 0;             /* symbolization disabled; raw addrs */
+static int stacks_outside_ns = 0;      /* task not visible in our pid namespace */
+static int stack_lookup_errno = 0;     /* first lookup errno, for diagnosis */
+
 /* Collected events */
 #define MAX_EVENTS 100000
 static struct unified_event {
@@ -41,6 +65,70 @@ static int event_count = 0;
 static void sig_handler(int sig)
 {
     exiting = true;
+}
+
+/* Print the NSpid line of /proc/<pid>/status (pid as seen from each
+ * namespace level, outermost visible first). Diagnostics only. */
+static void print_nspid(const char *label, const char *pidstr)
+{
+    char path[64], line[256];
+    snprintf(path, sizeof(path), "/proc/%s/status", pidstr);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "DEBUG %s: %s not found\n", label, path);
+        return;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "NSpid:", 6) || !strncmp(line, "Name:", 5))
+            fprintf(stderr, "DEBUG %s: %s", label, line);
+    }
+    fclose(f);
+}
+
+static int libbpf_print_fn(enum libbpf_print_level level,
+                           const char *fmt, va_list args)
+{
+    if (level == LIBBPF_DEBUG && !verbose)
+        return 0;
+    if (libbpf_quiet && !verbose)
+        return 0;
+    return vfprintf(stderr, fmt, args);
+}
+
+/* Write a program's config struct into its one-entry config map. Called
+ * after bpf_object__load() and BEFORE attaching, so no event ever sees an
+ * unconfigured program. (Config used to live in const volatile .rodata;
+ * clang 10 constant-folds that, ignoring every knob.) Returns 0 on success. */
+static int write_cfg_map(struct bpf_object *obj, const char *map_name,
+                         const void *cfg, size_t cfg_sz, const char *what)
+{
+    struct bpf_map *m = bpf_object__find_map_by_name(obj, map_name);
+    if (!m) {
+        fprintf(stderr, "ERROR: %s config map '%s' not found\n", what, map_name);
+        return -1;
+    }
+    if (bpf_map__value_size(m) != cfg_sz) {
+        fprintf(stderr, "ERROR: %s config size mismatch (bpf=%u, user=%zu); "
+                "struct definitions out of sync\n", what, bpf_map__value_size(m), cfg_sz);
+        return -1;
+    }
+    __u32 k0 = 0;
+    if (bpf_map_update_elem(bpf_map__fd(m), &k0, cfg, BPF_ANY) != 0) {
+        fprintf(stderr, "ERROR: writing %s config failed: %s\n", what, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* Kernel map id behind an fd, or 0 on error. Used to prove the CPU and
+ * GPU objects really share one stack_traces map. */
+static __u32 map_id_of(int fd)
+{
+    struct bpf_map_info info = {};
+    __u32 len = sizeof(info);
+    if (fd < 0 || bpf_obj_get_info_by_fd(fd, &info, &len) != 0)
+        return 0;
+    return info.id;
 }
 
 static const char* cuda_op_name(int op_type)
@@ -103,6 +191,22 @@ static int handle_cpu_event(void *ctx, void *data, size_t data_sz)
         return 0;
     
     struct cpu_sched_event *e = data;
+
+    /* --verbose: dump the first few malformed records (size/type/ts) so
+     * kernel- or layout-specific corruption is diagnosable from a log. */
+    static int bad_dumped = 0;
+    if (verbose && bad_dumped < 6 &&
+        (data_sz != sizeof(*e) || e->event_type < CPU_SCHED_ON ||
+         e->event_type > CPU_SCHED_WAKEUP || e->timestamp == 0)) {
+        const unsigned char *b = data;
+        fprintf(stderr, "DEBUG bad cpu record: size=%zu (expect %zu) type=%u ts=%llu pid=%u tid=%u state=%llu stack=%d bytes:",
+                data_sz, sizeof(*e), e->event_type, (unsigned long long)e->timestamp,
+                e->pid, e->tid, (unsigned long long)e->prev_state, e->stack_id);
+        for (size_t k = 0; k < data_sz && k < 64; k++)
+            fprintf(stderr, "%s%02x", (k % 8) ? "" : " ", b[k]);
+        fprintf(stderr, "\n");
+        bad_dumped++;
+    }
     events[event_count].timestamp = e->timestamp;
     events[event_count].type = 0; /* CPU */
     events[event_count].cpu = *e;
@@ -150,17 +254,21 @@ static void json_escape(char *dst, size_t dst_len, const char *src)
 }
 
 /* Pull stack addresses from the BPF stack map for the given stack_id.
- * Returns the number of valid (non-zero) addresses written into out[].
+ * Returns the number of valid (non-zero) addresses written into out[],
+ * or -1 if the lookup itself failed (stack_id not in the map we hold).
  */
 static int read_stack_addrs(int stack_id, __u64 *out, int out_cap)
 {
     if (stack_id < 0 || stack_map_fd < 0)
-        return 0;
+        return -1;
 
     __u64 stack[PERF_MAX_STACK_DEPTH];
     memset(stack, 0, sizeof(stack));
-    if (bpf_map_lookup_elem(stack_map_fd, &stack_id, stack) != 0)
-        return 0;
+    if (bpf_map_lookup_elem(stack_map_fd, &stack_id, stack) != 0) {
+        if (!stack_lookup_errno)
+            stack_lookup_errno = errno;
+        return -1;
+    }
 
     int n = 0;
     for (int i = 0; i < PERF_MAX_STACK_DEPTH && n < out_cap; i++) {
@@ -179,10 +287,41 @@ static int read_stack_addrs(int stack_id, __u64 *out, int out_cap)
  * Format:
  *   [{"sym":"...", "file":"...", "line":123, "lib":"libfoo.so", "inlined":0}, ...]
  */
+/* Raw-address frames, optionally preceded by an error marker frame. */
+static void emit_raw_frames(FILE *f, const __u64 *addrs, int n,
+                            const char *err, int pid)
+{
+    fprintf(f, "[");
+    int first = 1;
+    if (err) {
+        fprintf(f, "{\"err\":\"%s\",\"pid\":%d}", err, pid);
+        first = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        fprintf(f, "%s{\"addr\":\"0x%llx\"}", first ? "" : ",",
+                (unsigned long long)addrs[i]);
+        first = 0;
+    }
+    fprintf(f, "]");
+}
+
+/* Failure modes are kept distinct so the trace says WHICH link broke:
+ *   [{"err":"stack_lookup_failed",...}]           map/ID problem (kernel side)
+ *   [{"err":"symbolize_failed",...},{"addr":..}]  addrs OK, blazesym got 0 frames
+ *                                                 (dead pid, missing perf-map, ...)
+ *   [{"addr":..},...]                             symbolization disabled
+ *   [{"sym":..},...]                              resolved
+ * An empty [] is only emitted for a stack that genuinely had 0 frames.
+ */
 static void emit_stack_json(FILE *f, int stack_id, int pid)
 {
     __u64 addrs[PERF_MAX_STACK_DEPTH];
     int n = read_stack_addrs(stack_id, addrs, PERF_MAX_STACK_DEPTH);
+    if (n < 0) {
+        stacks_lookup_failed++;
+        fprintf(f, "[{\"err\":\"stack_lookup_failed\",\"stack_id\":%d}]", stack_id);
+        return;
+    }
     if (n == 0) {
         fprintf(f, "[]");
         return;
@@ -190,14 +329,18 @@ static void emit_stack_json(FILE *f, int stack_id, int pid)
     if (n > max_stack_frames_in_json)
         n = max_stack_frames_in_json;
 
+    /* Task lives outside the tracer's pid namespace: there is no
+     * /proc/<pid> to symbolize against from here. */
+    if ((unsigned)pid >= PID_OUTSIDE_NS_BASE) {
+        stacks_outside_ns++;
+        emit_raw_frames(f, addrs, n, "outside_pidns", (int)((unsigned)pid - PID_OUTSIDE_NS_BASE));
+        return;
+    }
+
     if (!symbolize_enabled || symbolizer == NULL) {
         /* Fallback: raw addresses. Still useful for grep/manual addr2line. */
-        fprintf(f, "[");
-        for (int i = 0; i < n; i++) {
-            fprintf(f, "%s{\"addr\":\"0x%llx\"}", i ? "," : "",
-                    (unsigned long long)addrs[i]);
-        }
-        fprintf(f, "]");
+        stacks_raw++;
+        emit_raw_frames(f, addrs, n, NULL, pid);
         return;
     }
 
@@ -210,8 +353,16 @@ static void emit_stack_json(FILE *f, int stack_id, int pid)
     }
 
     size_t nout = bsw_resolve(symbolizer, (uint32_t)pid,
-                              addrs, (size_t)n,
+                              (const uint64_t *)addrs, (size_t)n,
                               frames, (size_t)frame_cap);
+
+    if (nout == 0) {
+        stacks_symbolize_failed++;
+        emit_raw_frames(f, addrs, n, "symbolize_failed", pid);
+        free(frames);
+        return;
+    }
+    stacks_ok++;
 
     fprintf(f, "[");
     char esc_sym[BSW_STR_MAX * 2];
@@ -246,6 +397,42 @@ static int compare_events(const void *a, const void *b)
     return 0;
 }
 
+/* Per-thread scheduling state for building on/off-CPU spans. Small
+ * open-addressing table keyed by tid; replaces an 80 MB calloc indexed
+ * by tid. tid 0 (idle) is never inserted, so 0 marks an empty slot.
+ */
+struct tid_state {
+    __u32 tid;
+    __u64 on_ts;        /* last switch-on time, 0 = not on CPU */
+    __u64 off_ts;       /* last switch-off time, 0 = unknown */
+    __u64 off_state;    /* task state at switch-off (0 = preempted) */
+    __s32 off_stack;    /* off-CPU user stack id, -1 = none */
+};
+#define TID_TABLE_SIZE 65536u   /* power of two */
+static struct tid_state *tid_table;
+
+static struct tid_state *tid_get(__u32 tid)
+{
+    if (!tid_table || tid == 0)
+        return NULL;
+    __u32 idx = (tid * 2654435761u) & (TID_TABLE_SIZE - 1);
+    for (__u32 probe = 0; probe < TID_TABLE_SIZE; probe++) {
+        struct tid_state *ts = &tid_table[(idx + probe) & (TID_TABLE_SIZE - 1)];
+        if (ts->tid == tid)
+            return ts;
+        if (ts->tid == 0) {
+            ts->tid = tid;
+            ts->off_stack = -1;
+            return ts;
+        }
+    }
+    return NULL; /* table full: drop span tracking for this tid */
+}
+
+/* Network / subprocess / disk probes: loader + JSON writer. Uses the
+ * helpers defined above. */
+#include "io_trace.h"
+
 static void output_chrome_tracing_json(const char *filename)
 {
     FILE *f = fopen(filename, "w");
@@ -261,6 +448,9 @@ static void output_chrome_tracing_json(const char *filename)
             min_timestamp = events[i].timestamp;
         }
     }
+    min_timestamp = io_min_ts(min_timestamp);
+    if (min_timestamp == UINT64_MAX)
+        min_timestamp = 0;
     printf("Normalizing timestamps: base=%llu ns (%.3f ms since boot)\n", 
            min_timestamp, min_timestamp / 1000000.0);
     
@@ -279,11 +469,10 @@ static void output_chrome_tracing_json(const char *filename)
     fprintf(f, "{\n");
     fprintf(f, "  \"traceEvents\": [\n");
     
-    /* Track thread states for duration events - use dynamic allocation to avoid stack overflow */
-    /* Allocate large enough to handle high PIDs (up to 10 million) */
-    __u64 *cpu_on_time = calloc(10000000, sizeof(__u64));
-    if (!cpu_on_time) {
-        fprintf(stderr, "ERROR: Failed to allocate memory for cpu_on_time tracking\n");
+    /* Per-thread on/off-CPU state for building spans. */
+    tid_table = calloc(TID_TABLE_SIZE, sizeof(*tid_table));
+    if (!tid_table) {
+        fprintf(stderr, "ERROR: Failed to allocate tid table\n");
         fclose(f);
         return;
     }
@@ -322,11 +511,39 @@ static void output_chrome_tracing_json(const char *filename)
             /* CPU scheduling event */
             struct cpu_sched_event *cpu = &e->cpu;
             
+            struct tid_state *ts = tid_get(cpu->tid);
+
             if (cpu->event_type == CPU_SCHED_ON) {
-                /* Thread scheduled on CPU - start duration  */
-                /* Bounds check to avoid segfault */
-                if (cpu->tid < 10000000) {
-                    cpu_on_time[cpu->tid] = e->timestamp;
+                /* Close the preceding off-CPU span, if we saw this thread
+                 * go off. Blocked spans (state != 0) carry the stack of
+                 * where the thread blocked -- the "why was the agent
+                 * waiting" answer. Preempted spans (state == 0) are
+                 * run-queue wait: runnable but no CPU.
+                 */
+                if (ts && ts->off_ts != 0 && e->timestamp >= ts->off_ts) {
+                    double off_ts_us = (ts->off_ts - min_timestamp) / 1000.0;
+                    double off_dur_us = (e->timestamp - ts->off_ts) / 1000.0;
+                    int blocked = ts->off_state != 0;
+                    if (output_count > 0) fprintf(f, ",\n");
+                    fprintf(f, "    {\"name\": \"%s\", \"cat\": \"%s\", "
+                            "\"ph\": \"X\", \"ts\": %.3f, \"dur\": %.3f, "
+                            "\"pid\": %u, \"tid\": %u, "
+                            "\"args\": {\"state\": %llu",
+                            blocked ? "Off-CPU (blocked)" : "Runnable (preempted)",
+                            blocked ? "cpu_off" : "cpu_runq",
+                            off_ts_us, off_dur_us, cpu->pid, cpu->tid,
+                            (unsigned long long)ts->off_state);
+                    if (ts->off_stack >= 0) {
+                        fprintf(f, ", \"stack\": ");
+                        emit_stack_json(f, ts->off_stack, cpu->pid);
+                    }
+                    fprintf(f, "}}");
+                    output_count++;
+                }
+                if (ts) {
+                    ts->on_ts = e->timestamp;
+                    ts->off_ts = 0;
+                    ts->off_stack = -1;
                 }
 
                 if (output_count > 0) fprintf(f, ",\n");
@@ -334,33 +551,29 @@ static void output_chrome_tracing_json(const char *filename)
                 /* Keep name consistent as "On-CPU" so Begin/End events match */
                 fprintf(f, "    {\"name\": \"On-CPU\", \"cat\": \"cpu\", "
                         "\"ph\": \"B\", \"ts\": %.3f, \"pid\": %u, \"tid\": %u, "
-                        "\"args\": {\"cpu\": %u, \"comm\": \"%s\"",
+                        "\"args\": {\"cpu\": %u, \"comm\": \"%s\"}}",
                         ts_us, cpu->pid, cpu->tid, cpu->cpu, cpu->comm);
-
-                /* Emit resolved stack as a structured array. The pid for
-                 * symbolization is the event's own pid so we can attribute
-                 * stacks from any process, not just the target.
-                 */
-                if (cpu->stack_id >= 0) {
-                    fprintf(f, ", \"stack\": ");
-                    emit_stack_json(f, cpu->stack_id, cpu->pid);
-                }
-
-                fprintf(f, "}}");
                 output_count++;
             } else if (cpu->event_type == CPU_SCHED_OFF) {
-                /* Thread switched off CPU - end duration */
-                if (cpu->tid < 10000000 && cpu_on_time[cpu->tid] != 0) {
-                    double dur_us = (e->timestamp - cpu_on_time[cpu->tid]) / 1000.0;
+                /* Thread switched off CPU - end the on-CPU duration and
+                 * remember the off-CPU start + stack for the next ON. */
+                if (ts && ts->on_ts != 0) {
+                    double dur_us = (e->timestamp - ts->on_ts) / 1000.0;
                     if (output_count > 0) fprintf(f, ",\n");
                     fprintf(f, "    {\"name\": \"On-CPU\", \"cat\": \"cpu\", "
                             "\"ph\": \"E\", \"ts\": %.3f, \"pid\": %u, \"tid\": %u, "
                             "\"args\": {\"duration_us\": %.3f, \"state\": %llu}}",
-                            ts_us, cpu->pid, cpu->tid, dur_us, cpu->prev_state);
-                    cpu_on_time[cpu->tid] = 0;
+                            ts_us, cpu->pid, cpu->tid, dur_us,
+                            (unsigned long long)cpu->prev_state);
+                    ts->on_ts = 0;
                     output_count++;
                 } else {
                     should_output = 0;
+                }
+                if (ts) {
+                    ts->off_ts = e->timestamp;
+                    ts->off_state = cpu->prev_state;
+                    ts->off_stack = cpu->stack_id;
                 }
             } else if (cpu->event_type == CPU_SCHED_WAKEUP) {
                 /* Instant event for wakeup */
@@ -450,15 +663,29 @@ static void output_chrome_tracing_json(const char *filename)
         }
     }
     
+    /* Network, subprocess and disk rows. Events are sorted, so the last
+     * one bounds the trace for children that are still running. */
+    {
+        __u64 trace_end = event_count ? events[event_count - 1].timestamp : 0;
+        io_emit_chrome(f, min_timestamp, io_max_ts(trace_end), &output_count);
+    }
+
     fprintf(f, "\n  ],\n");
     fprintf(f, "  \"displayTimeUnit\": \"ms\",\n");
     fprintf(f, "  \"metadata\": {\n");
     fprintf(f, "    \"event_count\": %d,\n", event_count);
+    fprintf(f, "    \"stacks\": {\"ok\": %d, \"lookup_failed\": %d, "
+            "\"symbolize_failed\": %d, \"outside_pidns\": %d, \"raw\": %d},\n",
+            stacks_ok, stacks_lookup_failed, stacks_symbolize_failed,
+            stacks_outside_ns, stacks_raw);
+    fprintf(f, "    \"outside_pidns_base\": %u,\n", PID_OUTSIDE_NS_BASE);
+    io_emit_metadata(f);
     fprintf(f, "    \"tool\": \"ebpf-unified-trace\"\n");
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
     
-    free(cpu_on_time);
+    free(tid_table);
+    tid_table = NULL;
     fclose(f);
     printf("\n✓ Chrome Tracing JSON written to: %s\n", filename);
     printf("  Open in browser: chrome://tracing  (or https://ui.perfetto.dev)\n");
@@ -483,6 +710,7 @@ int main(int argc, char **argv)
     int symbolize_cli = 1;               /* default ON; --no-symbolize to disable */
     int sample_period_async = 8;         /* 1-in-8 by default for async ops */
     int sample_period_sync = 1;          /* every sync op by default */
+    int offcpu_stacks_cli = 1;           /* --no-offcpu-stacks to disable */
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -504,6 +732,25 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--stack-sample-sync") == 0 && i + 1 < argc) {
             sample_period_sync = atoi(argv[++i]);
             if (sample_period_sync <= 0) sample_period_sync = 1;
+        } else if (strcmp(argv[i], "--no-offcpu-stacks") == 0) {
+            offcpu_stacks_cli = 0;
+        } else if (strcmp(argv[i], "--io-pid") == 0 && i + 1 < argc) {
+            io_opt_target = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-net") == 0) {
+            io_opt_net = 0;
+        } else if (strcmp(argv[i], "--no-subprocess") == 0) {
+            io_opt_proc = 0;
+        } else if (strcmp(argv[i], "--no-disk") == 0) {
+            io_opt_disk = 0;
+        } else if (strcmp(argv[i], "--io-kprobes") == 0) {
+            io_opt_kprobes_only = 1;
+        } else if (strcmp(argv[i], "--no-follow-children") == 0) {
+            io_opt_follow_children = 0;
+        } else if (strcmp(argv[i], "--disk-min-us") == 0 && i + 1 < argc) {
+            io_opt_disk_min_us = atol(argv[++i]);
+            if (io_opt_disk_min_us < 0) io_opt_disk_min_us = 0;
+        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = 1;
         } else if (strcmp(argv[i], "--max-stack-frames") == 0 && i + 1 < argc) {
             max_stack_frames_in_json = atoi(argv[++i]);
             if (max_stack_frames_in_json <= 0) max_stack_frames_in_json = 12;
@@ -512,7 +759,16 @@ int main(int argc, char **argv)
                     "Usage: %s [--pid PID] [--duration SEC] [--output FILE]\n"
                     "          [--cuda-lib PATH] [--no-stacks] [--no-symbolize]\n"
                     "          [--stack-sample-async N] [--stack-sample-sync N]\n"
-                    "          [--max-stack-frames N]\n",
+                    "          [--max-stack-frames N] [--no-offcpu-stacks] [--verbose]\n"
+                    "          [--io-pid PID] [--no-net] [--no-subprocess] [--no-disk]\n"
+                    "          [--no-follow-children] [--disk-min-us N] [--io-kprobes]\n"
+                    "\n"
+                    "  --pid PID      trace this process: scheduling, CUDA, and the network /\n"
+                    "                 subprocess / disk activity of it and its children\n"
+                    "  --io-pid PID   process tree for the network / subprocess / disk probes\n"
+                    "                 only (default: --pid; 0 = every process)\n"
+                    "  --disk-min-us  drop file reads/writes shorter than N microseconds\n"
+                    "  --io-kprobes   use kprobes for net/disk even where fentry works\n",
                     argv[0]);
             return 1;
         }
@@ -533,10 +789,12 @@ int main(int argc, char **argv)
         }
     }
     
-    if (!cuda_lib_path) {
-        fprintf(stderr, "ERROR: CUDA library not found. Specify with --cuda-lib\n");
-        return 1;
-    }
+    /* No libcudart is not an error: an agent whose model runs in another
+     * process (or on the CPU) is still worth tracing for scheduling,
+     * network, subprocess and disk time. */
+    if (!cuda_lib_path)
+        fprintf(stderr, "NOTE: no CUDA library found (use --cuda-lib PATH); "
+                "tracing without CUDA uprobes\n");
     
     printf("Unified CPU+GPU Tracing\n");
     printf("=======================\n");
@@ -546,46 +804,103 @@ int main(int argc, char **argv)
         printf("Target PID: ALL\n");
     }
     printf("Duration: %d seconds\n", duration);
-    printf("CUDA library: %s\n", cuda_lib_path);
+    printf("CUDA library: %s\n", cuda_lib_path ? cuda_lib_path : "(none)");
     printf("Output: %s\n\n", output_file);
     
-    /* Enable libbpf logging for debugging */
-    libbpf_set_print(NULL);
-    
-    /* Load CPU scheduling BPF program */
-    cpu_obj = bpf_object__open_file("obj/trace_cpu_sched.bpf.o", NULL);
-    if (libbpf_get_error(cpu_obj)) {
-        fprintf(stderr, "ERROR: failed to open CPU BPF object\n");
-        goto cleanup;
-    }
-    
-    /* Set target_pid filter for CPU tracing BEFORE loading */
-    if (target_pid != 0) {
-        struct bpf_map *rodata = bpf_object__find_map_by_name(cpu_obj, ".rodata");
-        if (rodata) {
-            bpf_map__set_initial_value(rodata, &target_pid, sizeof(target_pid));
+    /* libbpf logging: warnings always, debug/verifier output with --verbose. */
+    libbpf_set_print(libbpf_print_fn);
+
+    /* Target pid namespace for id translation (see include/pidns.h).
+     * BPF reports root-namespace ids; inside WSL2 or a container those
+     * don't exist in the /proc we symbolize through. What matters is the
+     * namespace that OWNS that /proc -- the one /proc/1 lives in -- not
+     * necessarily our own: on WSL2 the tracer (launched via sudo from a
+     * wsl.exe session) was observed in a different pid namespace from the
+     * agent and from /proc, so translating into /proc/self/ns/pid still
+     * produced ids that /proc didn't know. Use /proc/1's namespace, fall
+     * back to our own. */
+    __u32 pidns_inum = 0;
+    __u64 pidns_dev = 0;
+    {
+        struct stat st_proc, st_self;
+        int have_proc = stat("/proc/1/ns/pid", &st_proc) == 0;
+        int have_self = stat("/proc/self/ns/pid", &st_self) == 0;
+        /* bpf_get_ns_current_pid_tgid() compares against the kernel's
+         * internal dev_t (MKDEV: major << 20 | minor), not glibc's st_dev
+         * encoding. They only agree for minor < 256; nsfs minors on WSL2
+         * are larger, so the raw st_dev made the helper fail silently. */
+        if (have_proc) {
+            pidns_inum = (__u32)st_proc.st_ino;
+            pidns_dev = ((__u64)major(st_proc.st_dev) << 20) | minor(st_proc.st_dev);
+        } else if (have_self) {
+            pidns_inum = (__u32)st_self.st_ino;
+            pidns_dev = ((__u64)major(st_self.st_dev) << 20) | minor(st_self.st_dev);
+        }
+        if (pidns_inum) {
+            printf("PID namespace: inode %u, nsfs dev %llu:%llu (ids reported as /proc sees them)\n",
+                   pidns_inum, (unsigned long long)(pidns_dev >> 20),
+                   (unsigned long long)(pidns_dev & 0xfffff));
+            if (have_proc && have_self && st_proc.st_ino != st_self.st_ino)
+                printf("ℹ tracer runs in a different pid namespace (inode %u) than /proc (inode %u); "
+                       "translating to /proc's\n", (__u32)st_self.st_ino, (__u32)st_proc.st_ino);
+        } else {
+            fprintf(stderr, "WARNING: cannot stat /proc/1/ns/pid or /proc/self/ns/pid (%s); "
+                    "reporting root-namespace ids\n", strerror(errno));
         }
     }
-    
-    err = bpf_object__load(cpu_obj);
-    if (err) {
-        fprintf(stderr, "ERROR: failed to load CPU BPF object: %d\n", err);
-        goto cleanup;
+
+    /* Remove a stale pin left by pre-reuse_fd builds (needs root; harmless
+     * if absent). Nothing pins stack_traces any more. */
+    if (unlink(STACK_TRACES_LEGACY_PIN_PATH) == 0)
+        printf("ℹ removed stale pinned map %s\n", STACK_TRACES_LEGACY_PIN_PATH);
+
+    /* ---- CPU scheduling object (optional: GPU tracing continues without it) */
+    cpu_obj = bpf_object__open_file("obj/trace_cpu_sched.bpf.o", NULL);
+    if (libbpf_get_error(cpu_obj)) {
+        fprintf(stderr, "WARNING: failed to open CPU BPF object; CPU tracing disabled\n");
+        cpu_obj = NULL;
     }
-    
-    /* Get stack traces map for symbol resolution */
-    struct bpf_map *stack_map = bpf_object__find_map_by_name(cpu_obj, "stack_traces");
-    if (stack_map) {
-        stack_map_fd = bpf_map__fd(stack_map);
-        target_pid_for_stacks = target_pid;
-        printf("✓ Stack trace collection enabled\n");
-    } else {
-        fprintf(stderr, "WARNING: stack_traces map not found\n");
+
+    if (cpu_obj) {
+        /* Must mirror struct sched_tracer_cfg in trace_cpu_sched.bpf.c. */
+        struct sched_tracer_cfg {
+            __u32 target_tgid;
+            __u8  offcpu_stacks;
+            __u8  _pad[3];
+            __u32 pidns_inum;
+            __u32 _pad2;
+        } sched_cfg = {
+            .target_tgid   = (__u32)target_pid,
+            .offcpu_stacks = (__u8)(offcpu_stacks_cli && capture_stacks_cli),
+            .pidns_inum    = pidns_inum,
+        };
+        err = bpf_object__load(cpu_obj);
+        if (!err && write_cfg_map(cpu_obj, "sched_cfg", &sched_cfg, sizeof(sched_cfg), "CPU") != 0)
+            err = -EINVAL;
+        if (err) {
+            fprintf(stderr, "WARNING: failed to load CPU BPF object: %d (%s); "
+                    "CPU tracing disabled. Re-run with --verbose for the libbpf/verifier log.\n"
+                    "         tp_btf programs need kernel BTF: check /sys/kernel/btf/vmlinux.\n",
+                    err, strerror(-err));
+            bpf_object__close(cpu_obj);
+            cpu_obj = NULL;
+        }
     }
-    
-    /* Attach CPU scheduling tracepoints */
+
+    if (cpu_obj) {
+        /* The CPU object owns the stack map; the GPU object reuses it. */
+        struct bpf_map *stack_map = bpf_object__find_map_by_name(cpu_obj, "stack_traces");
+        if (stack_map) {
+            stack_map_fd = bpf_map__fd(stack_map);
+            target_pid_for_stacks = target_pid;
+        } else {
+            fprintf(stderr, "WARNING: stack_traces map not found in CPU object\n");
+        }
+    }
+
     struct bpf_program *prog;
-    prog = bpf_object__find_program_by_name(cpu_obj, "trace_sched_switch");
+    /* Attach CPU scheduling tracepoints */
+    prog = cpu_obj ? bpf_object__find_program_by_name(cpu_obj, "trace_sched_switch") : NULL;
     if (prog) {
         sched_switch_link = bpf_program__attach(prog);
         if (!libbpf_get_error(sched_switch_link)) {
@@ -594,10 +909,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "WARNING: Failed to attach sched_switch\n");
         }
     } else {
-        fprintf(stderr, "WARNING: sched_switch program not found\n");
+        fprintf(stderr, "WARNING: sched_switch program not attached\n");
     }
     
-    prog = bpf_object__find_program_by_name(cpu_obj, "trace_sched_wakeup");
+    prog = cpu_obj ? bpf_object__find_program_by_name(cpu_obj, "trace_sched_wakeup") : NULL;
     if (prog) {
         sched_wakeup_link = bpf_program__attach(prog);
         if (!libbpf_get_error(sched_wakeup_link)) {
@@ -606,9 +921,17 @@ int main(int argc, char **argv)
             fprintf(stderr, "WARNING: Failed to attach sched_wakeup\n");
         }
     } else {
-        fprintf(stderr, "WARNING: sched_wakeup program not found\n");
+        fprintf(stderr, "WARNING: sched_wakeup program not attached\n");
     }
     
+    /* Network / subprocess / disk probes. After the CPU object (they
+     * share its stack map) and before the GPU one (which then shares
+     * whichever stack map exists). */
+    io_setup(target_pid, pidns_inum, pidns_dev, capture_stacks_cli);
+
+    if (!cuda_lib_path)
+        goto gpu_done;
+
     /* Load GPU CUDA BPF program */
     gpu_obj = bpf_object__open_file("obj/trace_cuda.bpf.o", NULL);
     if (libbpf_get_error(gpu_obj)) {
@@ -630,50 +953,56 @@ int main(int argc, char **argv)
         __u32 sample_period_sync;
         __u32 sample_period_async;
         __u8  capture_stacks;
-        __u8  _pad[3];
+        __u8  debug_pidns;
+        __u8  _pad[2];
+        __u32 pidns_inum;
+        __u32 _pad2;
+        __u64 pidns_dev;
     };
     struct cuda_tracer_cfg gpu_cfg = {
         .target_pid          = (__u32)target_pid,
         .sample_period_sync  = (__u32)sample_period_sync,
         .sample_period_async = (__u32)sample_period_async,
         .capture_stacks      = (__u8)capture_stacks_cli,
+        .pidns_inum          = pidns_inum,
+        .pidns_dev           = pidns_dev,
+        .debug_pidns         = (__u8)verbose,
     };
-    /* Find the .rodata map by its actual libbpf-assigned name. Newer
-     * libbpf prefixes the section with the object name (e.g.
-     * "trace_cu.rodata") so a plain ".rodata" lookup fails silently.
-     * Fall back to scanning all maps if the literal name isn't found.
-     */
-    struct bpf_map *gpu_rodata = bpf_object__find_map_by_name(gpu_obj, ".rodata");
-    if (!gpu_rodata) {
-        struct bpf_map *m;
-        bpf_object__for_each_map(m, gpu_obj) {
-            const char *name = bpf_map__name(m);
-            if (name && strstr(name, ".rodata")) {
-                gpu_rodata = m;
-                break;
-            }
+    /* Share ONE stack map between the CPU and GPU objects. Without this
+     * each object gets its own map, GPU stack ids get looked up in the
+     * CPU map, and every GPU stack comes back empty. */
+    if (stack_map_fd >= 0) {
+        struct bpf_map *gpu_stack_map = bpf_object__find_map_by_name(gpu_obj, "stack_traces");
+        if (!gpu_stack_map) {
+            fprintf(stderr, "WARNING: stack_traces map not found in GPU object\n");
+        } else if ((err = bpf_map__reuse_fd(gpu_stack_map, stack_map_fd)) != 0) {
+            fprintf(stderr, "WARNING: bpf_map__reuse_fd(stack_traces) failed: %d (%s); "
+                    "GPU stacks will not resolve\n", err, strerror(-err));
         }
-    }
-    if (gpu_rodata) {
-        size_t actual_sz = bpf_map__value_size(gpu_rodata);
-        if (actual_sz != sizeof(gpu_cfg)) {
-            fprintf(stderr,
-                    "WARNING: GPU .rodata size mismatch (kernel=%zu, user=%zu); "
-                    "PID filter and stack sampling may be ignored.\n",
-                    actual_sz, sizeof(gpu_cfg));
-        }
-        int rc = bpf_map__set_initial_value(gpu_rodata, &gpu_cfg, sizeof(gpu_cfg));
-        if (rc) {
-            fprintf(stderr, "WARNING: failed to set GPU .rodata: %d\n", rc);
-        }
-    } else {
-        fprintf(stderr, "WARNING: GPU .rodata map not found; using defaults\n");
     }
 
     err = bpf_object__load(gpu_obj);
     if (err) {
-        fprintf(stderr, "ERROR: failed to load GPU BPF object: %d\n", err);
+        fprintf(stderr, "ERROR: failed to load GPU BPF object: %d (%s)\n", err, strerror(-err));
         goto cleanup;
+    }
+    if (write_cfg_map(gpu_obj, "cuda_cfg", &gpu_cfg, sizeof(gpu_cfg), "GPU") != 0)
+        goto cleanup;
+
+    {
+        int gpu_stack_fd = bpf_object__find_map_fd_by_name(gpu_obj, "stack_traces");
+        if (stack_map_fd < 0) {
+            /* CPU object unavailable: GPU object owns the stack map. */
+            stack_map_fd = gpu_stack_fd;
+            target_pid_for_stacks = target_pid;
+        }
+        __u32 cpu_id = cpu_obj ? map_id_of(bpf_object__find_map_fd_by_name(cpu_obj, "stack_traces")) : 0;
+        __u32 gpu_id = map_id_of(gpu_stack_fd);
+        if (cpu_obj && cpu_id != gpu_id)
+            fprintf(stderr, "WARNING: CPU and GPU stack maps differ (id %u vs %u); "
+                    "stack ids will not resolve consistently\n", cpu_id, gpu_id);
+        else if (stack_map_fd >= 0)
+            printf("✓ Stack trace collection enabled (shared map id %u)\n", gpu_id);
     }
     
     /* Attach CUDA uprobes. Failure for any single function is non-fatal
@@ -740,6 +1069,12 @@ int main(int argc, char **argv)
     }
     printf("✓ Attached %d CUDA uprobes\n", gpu_link_count);
 
+gpu_done:
+    if (!cpu_obj && !gpu_obj && !io_rb) {
+        fprintf(stderr, "ERROR: no probe surface could be loaded; nothing to trace\n");
+        goto cleanup;
+    }
+
     /* Initialize symbolizer. Safe to call even if --no-symbolize is set;
      * we just skip the bsw_resolve path at JSON-emit time.
      */
@@ -763,29 +1098,32 @@ int main(int argc, char **argv)
                sample_period_sync, sample_period_async);
     }
     
-    /* Set up ring buffers */
-    cpu_map_fd = bpf_object__find_map_fd_by_name(cpu_obj, "cpu_events");
-    if (cpu_map_fd < 0) {
-        fprintf(stderr, "ERROR: failed to find cpu_events map\n");
-        goto cleanup;
+    /* Set up ring buffers (CPU one only if the sched object loaded) */
+    if (cpu_obj) {
+        cpu_map_fd = bpf_object__find_map_fd_by_name(cpu_obj, "cpu_events");
+        if (cpu_map_fd < 0) {
+            fprintf(stderr, "ERROR: failed to find cpu_events map\n");
+            goto cleanup;
+        }
+        cpu_rb = ring_buffer__new(cpu_map_fd, handle_cpu_event, NULL, NULL);
+        if (!cpu_rb) {
+            fprintf(stderr, "ERROR: failed to create CPU ring buffer\n");
+            goto cleanup;
+        }
     }
     
-    cpu_rb = ring_buffer__new(cpu_map_fd, handle_cpu_event, NULL, NULL);
-    if (!cpu_rb) {
-        fprintf(stderr, "ERROR: failed to create CPU ring buffer\n");
-        goto cleanup;
-    }
-    
-    gpu_map_fd = bpf_object__find_map_fd_by_name(gpu_obj, "cuda_events");
-    if (gpu_map_fd < 0) {
-        fprintf(stderr, "ERROR: failed to find cuda_events map\n");
-        goto cleanup;
-    }
-    
-    gpu_rb = ring_buffer__new(gpu_map_fd, handle_gpu_event, NULL, NULL);
-    if (!gpu_rb) {
-        fprintf(stderr, "ERROR: failed to create GPU ring buffer\n");
-        goto cleanup;
+    if (gpu_obj) {
+        gpu_map_fd = bpf_object__find_map_fd_by_name(gpu_obj, "cuda_events");
+        if (gpu_map_fd < 0) {
+            fprintf(stderr, "ERROR: failed to find cuda_events map\n");
+            goto cleanup;
+        }
+
+        gpu_rb = ring_buffer__new(gpu_map_fd, handle_gpu_event, NULL, NULL);
+        if (!gpu_rb) {
+            fprintf(stderr, "ERROR: failed to create GPU ring buffer\n");
+            goto cleanup;
+        }
     }
     
     signal(SIGINT, sig_handler);
@@ -798,20 +1136,95 @@ int main(int argc, char **argv)
     
     /* Poll for events */
     while (!exiting) {
-        err = ring_buffer__poll(cpu_rb, 10);
-        if (err == -EINTR) break;
-        
-        err = ring_buffer__poll(gpu_rb, 10);
-        if (err == -EINTR) break;
+        if (cpu_rb) {
+            err = ring_buffer__poll(cpu_rb, 10);
+            if (err == -EINTR) break;
+        }
+        io_poll(10);
+        if (gpu_rb) {
+            err = ring_buffer__poll(gpu_rb, 10);
+            if (err == -EINTR) break;
+        }
+        if (!cpu_rb && !gpu_rb && !io_rb)
+            usleep(10000);
+    }
+
+    /* Pick up whatever arrived between the last poll and the stop signal. */
+    if (cpu_rb) ring_buffer__consume(cpu_rb);
+    if (io_rb)  ring_buffer__consume(io_rb);
+    if (gpu_rb) ring_buffer__consume(gpu_rb);
+
+    printf("\nCollected %d sched/GPU events, %zu net, %zu subprocess, %zu disk. Processing...\n",
+           event_count, io_net_n, io_proc_n, io_disk_n);
+    if (event_count >= MAX_EVENTS)
+        fprintf(stderr, "WARNING: hit MAX_EVENTS (%d); later events were dropped\n", MAX_EVENTS);
+
+    /* Report kernel-side ring-buffer drops (per-CPU counter). */
+    if (cpu_obj) {
+        int drops_fd = bpf_object__find_map_fd_by_name(cpu_obj, "cpu_drops");
+        int ncpu = libbpf_num_possible_cpus();
+        if (drops_fd >= 0 && ncpu > 0) {
+            __u64 *vals = calloc(ncpu, sizeof(__u64));
+            __u32 key = 0;
+            if (vals && bpf_map_lookup_elem(drops_fd, &key, vals) == 0) {
+                __u64 total = 0;
+                for (int c = 0; c < ncpu; c++) total += vals[c];
+                if (total)
+                    fprintf(stderr, "WARNING: %llu CPU sched events dropped "
+                            "(ring buffer full); use --pid to narrow\n",
+                            (unsigned long long)total);
+            }
+            free(vals);
+        }
     }
     
-    printf("\nCollected %d events. Processing...\n", event_count);
-    
+    if (verbose && gpu_obj) {
+        struct { __u32 level; __s32 helper_rc; __u32 helper_pid, helper_tgid;
+                 __u32 nr[4], inum[4], tgid_nr[4]; } d = {0};
+        int dfd = bpf_object__find_map_fd_by_name(gpu_obj, "pidns_debug");
+        __u32 k0 = 0;
+        if (dfd >= 0 && bpf_map_lookup_elem(dfd, &k0, &d) == 0) {
+            fprintf(stderr, "DEBUG pidns chain: level=%u helper_rc=%d helper=(tgid %u, tid %u)\n",
+                    d.level, d.helper_rc, d.helper_tgid, d.helper_pid);
+            for (int i = 0; i < 4; i++)
+                fprintf(stderr, "DEBUG   numbers[%d]: tid nr=%u tgid nr=%u ns.inum=%u\n",
+                        i, d.nr[i], d.tgid_nr[i], d.inum[i]);
+        }
+    }
+
+    /* pid-namespace sanity check (a few lines, always printed): do the
+     * pids we recorded exist in the /proc we will symbolize through? */
+    {
+        fprintf(stderr, "DEBUG tracer getpid()=%d\n", getpid());
+        print_nspid("tracer", "self");
+        /* Up to 4 distinct GPU-event pids: do they exist in our /proc? */
+        __u32 seen[4] = {0};
+        int nseen = 0;
+        for (int i = 0; i < event_count && nseen < 4; i++) {
+            if (events[i].type != 1) continue;
+            __u32 p = events[i].gpu.pid;
+            int dup = 0;
+            for (int k = 0; k < nseen; k++) dup |= seen[k] == p;
+            if (dup) continue;
+            seen[nseen++] = p;
+            char ps[16], lbl[48];
+            snprintf(ps, sizeof(ps), "%u", p);
+            snprintf(lbl, sizeof(lbl), "gpu pid %u (comm %s)", p, events[i].gpu.comm);
+            print_nspid(lbl, ps);
+        }
+    }
+
     /* Sort events by timestamp */
     qsort(events, event_count, sizeof(struct unified_event), compare_events);
     
     /* Output Chrome Tracing JSON */
     output_chrome_tracing_json(output_file);
+    io_print_summary();
+    printf("  Stacks: %d resolved, %d lookup_failed, %d symbolize_failed, %d outside_pidns, %d raw\n",
+           stacks_ok, stacks_lookup_failed, stacks_symbolize_failed, stacks_outside_ns, stacks_raw);
+    if (stacks_lookup_failed)
+        fprintf(stderr, "  NOTE: stack lookups failed (first errno %d: %s) -- stack map problem, "
+                "not symbolization.\n", stack_lookup_errno, strerror(stack_lookup_errno));
     
 cleanup:
     ring_buffer__free(cpu_rb);
@@ -820,6 +1233,7 @@ cleanup:
     bpf_link__destroy(sched_wakeup_link);
     for (int i = 0; i < (int)(sizeof(gpu_links)/sizeof(gpu_links[0])); i++)
         bpf_link__destroy(gpu_links[i]);
+    io_cleanup();
     bpf_object__close(cpu_obj);
     bpf_object__close(gpu_obj);
     if (symbolizer) {

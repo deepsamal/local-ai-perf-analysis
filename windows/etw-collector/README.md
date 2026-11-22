@@ -1,0 +1,192 @@
+# etw-collector
+
+The Windows counterpart of `bin/unified_trace`. It traces a local-AI agent
+running natively on Windows (Ollama, llama.cpp, LiteRT-LM, a Python agent)
+with ETW, then writes Chrome Trace JSON in the same layout as the eBPF tool:
+the same `cpu_off` / `cpu_runq` categories and a `metadata` block. Open the
+output in Perfetto or `chrome://tracing`.
+
+## What it captures
+
+| Signal | ETW source | Session | Privilege |
+|---|---|---|---|
+| On-CPU, blocked (with wait reason), runnable | Kernel Thread class: CSwitch (36), ReadyThread (50), thread rundown | kernel | Administrator |
+| Hard page faults (model weights paged in from disk) | Kernel PageFault class, HardFault (32) | kernel | Administrator |
+| Process tree | Toolhelp snapshot at start; kernel Process class + `Microsoft-Windows-Kernel-Process` for later starts | both | snapshot: none; live starts: Administrator |
+| GPU execution per context | `Microsoft-Windows-DxgKrnl`: QueuePacket 178/180, DmaPacket 175/177 | user | Admin or *Performance Log Users* |
+| TCP send/recv (e.g. agent ↔ `ollama serve` on :11434) | `Microsoft-Windows-Kernel-Network` 10/11/26/27 | user | Administrator |
+
+On GPUs where DxgKrnl emits DMA packet events, the GPU spans show hardware
+execution, serialised per context the way PresentMon does it. With
+hardware-accelerated GPU scheduling (HAGS) the DMA events are often missing.
+The collector then falls back to queue-packet start/stop, which also counts
+time spent waiting in the queue. Each process's `gpu_source` in the summary
+says which model was used (`dma` or `queue`). Wait and signal packets are
+skipped. This view covers DirectX, Vulkan and DirectML, plus CUDA on WDDM.
+CUDA kernels on a TCC-mode GPU never pass through DxgKrnl, so they do not
+appear here.
+
+Only DxgKrnl can be enabled by a member of *Performance Log Users*: on
+Windows 11, `Kernel-Process` and `Kernel-Network` return access denied
+without elevation. The collector reports the token's groups, tries each
+provider on its own, and records with whatever it is allowed to enable.
+A non-elevated run therefore gives GPU spans only. Processes that start
+mid-capture are then picked up only if they submit GPU work and were in
+the start-up snapshot.
+
+## Stacks (`--stacks`, Administrator)
+
+`--stacks` (= `--stacks=full`) turns on kernel stack walking for three event types, and adds a
+module rundown and DbgHelp symbolisation at the end of the capture:
+
+| Event | Stack shows | Where it lands |
+|---|---|---|
+| CSwitch | where the thread was waiting | `args.stack` on each *Off-CPU (blocked)* span; `<output>.offcpu.folded`, weighted by µs blocked |
+| ReadyThread | who woke it, and from where | `args.woken_by` and `args.waker_stack` on the blocked span |
+| SampledProfile (1 kHz) | what the thread was doing on-CPU | `<output>.oncpu.folded`; hot frames printed in the summary |
+| GPU packets (both modes; no extra stack walk) | which code submitted the GPU work: the on-CPU sample of the submitting thread nearest the packet, within 2 ms | `submit_thread` and `args.stack` on GPU spans (the stack once per run of identical ones); `<output>.gpu.folded`, weighted by µs of GPU execution |
+
+Threads are labelled with their name, or failing that their resolved entry
+point (`ggml-cuda.dll!...`, `ntdll.dll!TppWorkerThread`), instead of a bare
+tid. Open the `.folded` files in speedscope.app or flamegraph.pl.
+
+Symbols resolve as far as the binaries allow:
+
+* DbgHelp is loaded at run time and prefers the Windows SDK Debugging
+  Tools copy (`Windows Kits\10\Debuggers\x64`), which can download PDBs
+  through `symsrv.dll`. Override it with `ETW_COLLECTOR_DBGHELP`.
+* With those tools installed and no `--symbol-path`/`_NT_SYMBOL_PATH`,
+  Microsoft's server is used, with a cache in
+  `%LOCALAPPDATA%\etw-collector\symbols`. The first run downloads PDBs
+  for ntoskrnl, ntdll and the others; later runs are fast. Without the
+  tools, you get export names only.
+* Export-only modules are typical of third-party DLLs (NVIDIA, ggml). There
+  a frame more than 16 KB past the nearest export shows as `module+0xoffset`
+  rather than under a misleading name. Itanium C++ names from clang/MinGW
+  builds are demangled.
+* Go binaries (`ollama.exe`) carry no PDB, so their frames stay
+  `ollama.exe+0x...` until a Go symbol-table reader is added.
+* The summary lists the symbol type DbgHelp got for each module
+  (`symbols=pdb: ...`, `symbols=exports: ...`).
+* `etw-collector --symbol-selftest` (no admin needed) reports which
+  dbghelp is in use and whether PDB download works.
+
+**Overhead.** ETW walks each stack inside the thread that triggered the
+event. The user-mode half is walked by an APC when the thread returns to
+user mode. So the traced program pays for it, and samples land in
+`EtwpStackWalkApc` / `RtlWalkFrameChain`. Those frames are folded into a
+single `[ETW stack walk]` leaf, and the summary prints the share for each
+process. In the Ollama capture this was ~6% for llama-server and ~30% for
+Go's `ollama.exe`, which switches threads constantly. `--stacks=sample`
+walks stacks only for the 1 kHz CPU samples: no blocking stacks or wakers,
+but much less overhead. Keep full captures short (≤ 30 s); the summary warns
+if events were lost.
+
+## Python frames (on by default, no admin)
+
+ETW stacks stop at the interpreter: every Python call is the same
+`_PyEval_EvalFrameDefault`. For target processes that are CPython
+interpreters the collector therefore samples the Python stack from outside
+the process with the [py-spy](https://github.com/benfred/py-spy) library
+(`src/pysample.rs`). It works on the Python the user already has: no debug
+build, no restart, nothing loaded into the target.
+
+| Output | Content |
+|---|---|
+| `Python: <thread>` track | one slice per stretch where the thread's Python stack did not change, named by the leaf function |
+| `args.py_stack` on *Off-CPU (blocked)* spans | the Python code the thread was in while it waited (`py_match` says whether a sample fell inside the wait or the nearest one within 50 ms was used) |
+| `args.py_stack` on TCP events, `metadata.python_network` | bytes sent and received per Python call site and remote. A send is matched through the thread that logged it; received data is logged from a system thread, so it goes to the only Python thread sitting in a socket call at that moment, or stays unmatched when there are none or several (`py_match` says which) |
+| `<output>.py-offcpu.folded` | Python stacks weighted by µs blocked, with the wait reason as leaf |
+| `<output>.py.folded` | Python stacks weighted by samples (wall clock: waiting threads are sampled too) |
+
+It is a sampler (100 Hz, `--py-rate`), not an event-time unwinder. A wait
+longer than the sampling period gets its exact stack; a shorter one gets a
+neighbouring sample. Sampling is non-blocking: the target is never
+suspended, so the scheduling data is not disturbed. The summary line
+reports read errors and the sampler's own CPU cost.
+
+The blocked-span join needs the kernel session (Administrator). Without it
+you still get the Python tracks and `py.folded`. `--no-py` turns it off;
+`--py-selftest PID` samples one process and prints what it sees, without
+ETW, on any OS. Processes that start mid-capture are picked up within about
+a second if the collector can see process starts (Administrator); a Python
+child that lives for less than that is missed.
+
+## Optional: Nsight Systems co-analysis (`--nsys`)
+
+ETW alone is enough for most questions. It shows GPU packets, which threads
+wait and where, and CPU stacks. Nsight's CUPTI trace adds what ETW cannot
+see: CUDA kernel names, every CUDA API call with its duration, and
+memory copies. Use it when you need to know which kernels, or how long
+each `cudaStreamSynchronize` takes:
+
+```powershell
+nsys export -t sqlite -o C:\nsys\run.sqlite C:\nsys\run.nsys-rep
+etw-collector --nsys C:\nsys\run.sqlite -o nsys_report.json          # Nsight-only report
+etw-collector --replay etw.raw.jsonl --process-name ollama --nsys C:\nsys\run.sqlite
+```
+
+The summary splits the capture into GPU-busy segments (requests). For each
+segment it prints GPU utilisation, the time spent in CUDA sync and how busy
+the GPU was during it, and the top kernels. Device-to-host copies of the
+most common size (the logits) mark token boundaries. From these it gives
+per-token time, GPU-busy share, the CPU gap between tokens, and launches
+per token with their CPU cost. When the Nsight session overlaps the ETW
+capture in wall-clock time, kernels, copies and API calls also become
+tracks under the same process. Otherwise only the summary is written
+(`metadata.nsight`).
+
+Getting a usable Nsight capture of a local-model server is fiddly. Version
+support for older GPUs, Ollama's GPU discovery under Nsight, and paths
+with spaces all get in the way. See `docs/NSIGHT_SETUP.md`. The feature
+is a default cargo feature (`nsight`, bundles SQLite);
+`--no-default-features` drops it.
+
+Nsight's tracing has its own observer effect: about 4 µs per kernel
+launch. On the GTX 1080 / qwen2.5:0.5b run, the GPU looked 72% busy under
+Nsight against 89% under ETW. Treat Nsight's idle and gap times as upper
+bounds.
+
+## Usage
+
+```powershell
+cargo build --release
+# elevated prompt for CPU + faults:
+.\target\release\etw-collector.exe --process-name ollama --follow-children --duration 30 `
+    --output ollama.json --save-raw ollama.raw.jsonl
+```
+
+Use `--pid N` or `--process-name NAME` to pick targets; both can be
+repeated. `--follow-children` adds runner processes that start during the
+capture. `--no-cpu`, `--no-faults`, `--no-gpu` and `--no-net` turn sources
+off. `-v` prints a count of each event and every field that failed to parse.
+
+The console summary for each process shows on-CPU time, blocked time and
+its top wait reasons, runnable (CPU-starved) time, GPU busy time, hard faults
+and TCP bytes.
+
+## Design
+
+* `model.rs` defines `Raw`, a compact serialisable event built in the ETW
+  callbacks.
+* `filter.rs` holds `LiveFilter`. It tracks processes and threads as they
+  appear and drops context switches that don't involve the target, so a
+  system-wide kernel session stays small.
+* `spans.rs` does the offline correlation into spans and summaries.
+* `chrome.rs` writes the Chrome JSON.
+* `etw.rs` contains the sessions, providers and field parsing, and is
+  `cfg(windows)`.
+
+Everything except `etw.rs` is platform-independent, and
+`cargo test` runs it on Linux. Running `--replay RAW.jsonl` on any OS repeats
+the analysis on a saved capture without re-tracing.
+
+## Not yet
+
+* Go symbol table (pclntab) reader for `ollama.exe` frames.
+* Python frames on the Linux tracer (`unified_trace`); the sampler module is
+  portable but only wired into this collector.
+* HTTP-level semantics for Ollama/OpenAI-compatible APIs (load, prefill and
+  decode phases).
+* NPU (DirectML/MCDM) engines. They show up as DxgKrnl contexts, but are not
+  yet labelled by engine type.

@@ -189,33 +189,44 @@ Attaching 28 uprobes takes ~500–1000 ms. A short CUDA program (e.g. the bundle
 
 ## Known issues
 
-### PyTorch + Python 3.12 `-X perf` on WSL2 — Python frames unresolved
+### WSL2: PID mismatch and empty stacks — resolved
 
-Status: partial. The CUDA + stack-capture pipeline is fully validated against
-real NVIDIA libcudart (`make test-gpu`). What's not yet working: when a
-PyTorch agent runs under Python 3.12 with `-X perf` on WSL2, captured CUDA
-events attribute to a different PID than `os.getpid()` reports for the agent,
-breaking the perf-map → Python frame resolution chain.
+The "CUDA events attribute to a different PID than `os.getpid()`" symptom
+had three independent causes, all fixed on `fix/stack-map-and-sched`:
 
-Possible causes (not yet isolated):
+1. **PID namespaces.** WSL2 runs each distro in its own pid namespace; BPF
+   helpers report root-namespace ids, which don't exist in the distro's
+   `/proc` (so symbolization failed and `--pid` never matched). Ids are now
+   translated into the namespace of the `/proc` the tracer symbolizes
+   through (`include/pidns.h`). Tasks outside it are reported as
+   root id + 2^30 and their stacks are marked `outside_pidns`.
+2. **clang 10** (Ubuntu 20.04's default, common in WSL distros) constant-
+   folded the `const volatile` config struct, so the pid filter, sampling
+   knobs and namespace translation silently never applied, and it dropped
+   stores into ringbuf records (all-zero OFF events). Config now lives in
+   BPF array maps and sched records are built on the stack. `make` picks the
+   newest installed clang and warns below 12; `sudo apt-get install clang-14`
+   is still recommended.
+3. **Two stack maps.** The CPU and GPU objects could end up with separate
+   `stack_traces` maps, so GPU stack ids were looked up in the wrong one.
+   They now share one map via `bpf_map__reuse_fd()`.
 
-- PyTorch's CUDA caching allocator may issue calls from a worker context that
-  the kernel sees under a different TGID. The Python interpreter's PID and
-  the calling thread's PID upper-32 should be equal under POSIX threads, but
-  CUDA library internals may not use plain pthreads.
-- `-X perf`'s trampoline mechanism in Python 3.12 may interact with torch
-  in a way that obscures the calling stack.
-- The cu126 torch wheel on WSL2 with the bundled driver stub appears
-  unstable for some operations, which makes longer-running test agents
-  hard to keep alive for symbolization.
+Diagnosing: every trace prints the tracer's pid/NSpid and whether recorded
+GPU pids exist in `/proc`; `--verbose` adds the kernel's pid chain for a
+CUDA-calling task. Empty stacks are labelled `stack_lookup_failed`,
+`symbolize_failed` or `outside_pidns` in the JSON.
 
-Workaround: use `make test-gpu` (vanilla CUDA program with `--cudart=shared`)
-to validate the full stack-attribution pipeline; that path is fully working
-on the same machine.
+### Python frames still missing from CUDA stacks
 
-Re-investigation path: reproduce on a non-WSL Linux box with a more
-current NVIDIA driver, or with `cu118` wheel, to rule out the WSL2 +
-cu126 + driver-mismatch combination as the cause.
+Stacks now resolve (Phase 0 passes 5/5 on WSL2), but they end after ~6
+native frames inside libtorch. `bpf_get_stackid()` unwinds by frame
+pointer, and the PyTorch wheels and stock CPython 3.12 are built without
+frame pointers, so the unwinder never reaches the interpreter or the
+perf-map frames for `agent.py`. Options are in
+[PYTHON_ATTRIBUTION.md](PYTHON_ATTRIBUTION.md): a frame-pointer CPython
+build (3.12+ `--enable-frame-pointers`-style builds, or a distro that ships
+one), USDT markers at agent-step boundaries, or a py-spy-style userspace
+unwinder.
 
 ## Next steps
 
